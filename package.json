@@ -1,0 +1,22 @@
+{
+  "name": "everything-webgpu",
+  "version": "0.1.0",
+  "description": "Firefox WebExtension that runs local MLC/WebLLM models on WebGPU with drag-and-drop cache injection.",
+  "scripts": {
+    "build": "node build.mjs",
+    "check": "node build.mjs --check-entries",
+    "test": "node --test test/integration.test.mjs",
+    "package": "npm run build && node build.mjs --zip",
+    "e2e": "node test/e2e/run.mjs"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@mlc-ai/web-llm": "^0.2.84"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2"
+  },
+  "type": "module",
+  "private": true
+}

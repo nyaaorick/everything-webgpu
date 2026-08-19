@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Everything WebGPU — Models</title>
+  <link rel="stylesheet" href="../ui.css" />
+  <link rel="stylesheet" href="manager.css" />
+</head>
+<body>
+<div class="wrap">
+
+  <header class="row">
+    <span id="dot" class="dot"></span>
+    <h1 class="grow">Everything WebGPU</h1>
+    <span id="engineStatus" class="muted mono"></span>
+  </header>
+
+  <section id="gpu" class="banner" hidden></section>
+
+  <section>
+    <h2>Add a model</h2>
+    <div id="drop" tabindex="0">
+      <strong>Drop a compiled MLC model folder here</strong>
+      <p class="muted">
+        Files are copied straight into this extension's Cache Storage — nothing is downloaded.
+        The folder needs <code>mlc-chat-config.json</code>, <code>tensor-cache.json</code>
+        (or <code>ndarray-cache.json</code>), every <code>params_shard_*.bin</code>,
+        <code>tokenizer.json</code>, and exactly one <code>*-webgpu.wasm</code> model library.
+      </p>
+      <button id="pick">Choose folder…</button>
+      <input id="picker" type="file" webkitdirectory directory multiple hidden />
+    </div>
+    <div id="ingest" hidden>
+      <div class="bar"><i id="ingestBar"></i></div>
+      <div id="ingestStatus" class="muted mono"></div>
+    </div>
+    <div id="ingestError" class="banner error" hidden></div>
+  </section>
+
+  <section>
+    <h2>Local models</h2>
+    <table id="models">
+      <thead>
+        <tr><th>Model</th><th>Size</th><th>Shards</th><th>Library</th><th>Cache</th><th></th></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+    <p id="noModels" class="muted" hidden>Nothing registered yet.</p>
+    <p class="muted mono">Storage in use: <span id="quota">—</span></p>
+  </section>
+
+  <section>
+    <h2>Generation defaults</h2>
+    <div class="grid">
+      <label>Temperature <input id="temperature" type="number" min="0" max="2" step="0.05" /></label>
+      <label>Max tokens <input id="maxTokens" type="number" min="1" max="32768" step="1" /></label>
+    </div>
+    <label class="block">System prompt
+      <textarea id="systemPrompt" rows="3" placeholder="(none)"></textarea>
+    </label>
+    <label class="block">External extension allowlist
+      <input id="allowedExternalIds" type="text" placeholder="empty = allow every installed extension" />
+      <span class="muted mono">Comma-separated extension IDs permitted to call the engine API.</span>
+    </label>
+    <div class="row">
+      <button id="save" class="primary">Save settings</button>
+      <span id="saved" class="muted" hidden>Saved.</span>
+    </div>
+  </section>
+
+  <section>
+    <h2>API for other extensions</h2>
+    <p class="muted">Any Firefox extension can drive this engine by messaging <code id="selfId" class="mono"></code>.</p>
+    <pre class="mono"><code id="apiSample"></code></pre>
+  </section>
+
+  <section>
+    <h2>Firefox setup (macOS)</h2>
+    <p class="muted">WebGPU/Metal must be enabled in <code>about:config</code> before a model can load:</p>
+    <table class="flags">
+      <tbody>
+        <tr><td class="mono">dom.webgpu.enabled</td><td class="mono">true</td><td class="muted">Exposes <code>navigator.gpu</code>.</td></tr>
+        <tr><td class="mono">gfx.webgpu.ignore-blocklist</td><td class="mono">true</td><td class="muted">Only if your Mac's GPU is blocklisted.</td></tr>
+        <tr><td class="mono">dom.webgpu.service-workers.enabled</td><td class="mono">true</td><td class="muted">Harmless; needed on builds that gate worker contexts.</td></tr>
+      </tbody>
+    </table>
+    <p class="muted">Restart Firefox after changing these. Nightly on Apple Silicon is the best-tested combination.</p>
+  </section>
+
+</div>
+<script type="module" src="manager.js"></script>
+</body>
+</html>

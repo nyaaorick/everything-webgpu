@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Everything WebGPU</title>
+  <link rel="stylesheet" href="../ui.css" />
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <header>
+    <div class="row">
+      <span id="dot" class="dot"></span>
+      <h1 class="grow">Everything WebGPU</h1>
+      <button id="manage" title="Manage local models">Models…</button>
+    </div>
+    <div class="row">
+      <select id="model" class="grow"></select>
+      <button id="load" class="primary">Load</button>
+      <button id="unload" title="Free VRAM">Eject</button>
+    </div>
+    <div class="bar"><i id="progress"></i></div>
+    <div id="status" class="muted mono">Checking engine…</div>
+  </header>
+
+  <main id="log" aria-live="polite"></main>
+
+  <footer>
+    <textarea id="input" rows="2" placeholder="Ask the local model…"></textarea>
+    <div class="row">
+      <button id="clear">Clear</button>
+      <span class="grow"></span>
+      <button id="stop" class="danger" hidden>Stop</button>
+      <button id="send" class="primary">Send</button>
+    </div>
+  </footer>
+
+  <script type="module" src="popup.js"></script>
+</body>
+</html>

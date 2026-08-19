@@ -1,0 +1,37 @@
+.wrap { max-width: 820px; margin: 0 auto; padding: 24px 20px 60px; display: flex; flex-direction: column; gap: 26px; }
+
+header { padding-bottom: 12px; border-bottom: 1px solid var(--line); }
+section { display: flex; flex-direction: column; gap: 10px; }
+
+#drop {
+  border: 1.5px dashed var(--line);
+  border-radius: 12px;
+  padding: 26px 20px;
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  align-items: center;
+  transition: border-color .15s, background .15s;
+}
+#drop.over { border-color: var(--accent); background: rgba(124, 156, 255, .08); }
+#drop p { margin: 0; max-width: 560px; }
+
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+th { color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
+td.mono { font-family: "SF Mono", ui-monospace, Menlo, monospace; font-size: 11px; }
+table.flags td { border: none; padding: 3px 10px 3px 0; }
+
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; }
+label { display: flex; flex-direction: column; gap: 4px; color: var(--muted); font-size: 12px; }
+label.block { width: 100%; }
+label input, label textarea { color: var(--text); }
+textarea { resize: vertical; }
+
+pre { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; overflow-x: auto; margin: 0; }
+code { font-family: "SF Mono", ui-monospace, Menlo, monospace; }
+
+.pill { padding: 2px 7px; border-radius: 99px; font-size: 10px; border: 1px solid var(--line); }
+.pill.ok { color: var(--ok); border-color: var(--ok); }
+.pill.bad { color: var(--danger); border-color: var(--danger); }
