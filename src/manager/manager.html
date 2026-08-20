@@ -54,7 +54,11 @@
     <div class="grid">
       <label>Temperature <input id="temperature" type="number" min="0" max="2" step="0.05" /></label>
       <label>Max tokens <input id="maxTokens" type="number" min="1" max="32768" step="1" /></label>
+      <label>Engines in pool <input id="engineCount" type="number" min="1" max="4" step="1" /></label>
+      <label>Decode steps per sync <input id="decodeSteps" type="number" min="1" max="32" step="1" /></label>
     </div>
+    <p id="poolCost" class="muted mono"></p>
+    <p id="decodeCost" class="muted mono"></p>
     <label class="block">System prompt
       <textarea id="systemPrompt" rows="3" placeholder="(none)"></textarea>
     </label>
@@ -71,6 +75,11 @@
   <section>
     <h2>API for other extensions</h2>
     <p class="muted">Any Firefox extension can drive this engine by messaging <code id="selfId" class="mono"></code>.</p>
+    <p class="muted">
+      One generation can never exceed ~10 tok/s (see the README). Concurrent ones each get their own ~10 tok/s,
+      so send independent work as a single <code>batch</code> rather than a loop of <code>chat</code> calls, and
+      tag latency-critical work <code>priority: "interactive"</code>.
+    </p>
     <pre class="mono"><code id="apiSample"></code></pre>
   </section>
 

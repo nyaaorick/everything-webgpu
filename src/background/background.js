@@ -3,27 +3,37 @@
  *
  * The MV2 persistent background page is a real document on the extension
  * origin, so it has `navigator.gpu` and the same Cache Storage the manager page
- * writes into. Keeping the engine here means the model stays resident in VRAM
+ * writes into. Keeping the engines here means the weights stay resident in VRAM
  * across popup opens and across calls from other extensions.
+ *
+ * All generation goes through one EnginePool, which owns priority, cancellation
+ * and fan-out. Nothing here decides what runs when.
  */
-import { ENGINE_STATE, OP, PORT_NAME, PORT_OP, PROTOCOL } from "../lib/protocol.js";
 import {
-  getSettings,
-  listModels,
-  toAppConfig,
-  verifyModelCache,
-} from "../lib/model-store.js";
+  ENGINE_STATE,
+  OP,
+  PORT_NAME,
+  PORT_OP,
+  PRIORITY,
+  PROTOCOL,
+  WORKER_CONFIGURE,
+} from "../lib/protocol.js";
+import { getSettings, listModels, setSettings, toAppConfig, verifyModelCache } from "../lib/model-store.js";
+import { clampSteps } from "./multistep.js";
+import { EnginePool } from "./pool.js";
 
 const state = {
   status: ENGINE_STATE.IDLE,
   modelId: null,
   progress: null,
   error: null,
-  busy: false,
+  pool: { size: 0, busy: 0, queued: 0 },
+  /** Latest decode probe from an engine worker; see multistep.js. */
+  decode: null,
 };
 
-/** @type {import("../../vendor/web-llm.js").MLCEngineInterface | null} */
-let engine = null;
+/** @type {EnginePool | null} */
+let pool = null;
 let loading = null;
 const subscribers = new Set();
 
@@ -34,15 +44,7 @@ function setState(patch) {
   broadcast({ protocol: PROTOCOL, op: PORT_OP.ENGINE_STATE, state: snapshot() });
 }
 
-function snapshot() {
-  return {
-    status: state.status,
-    modelId: state.modelId,
-    progress: state.progress,
-    error: state.error,
-    busy: state.busy,
-  };
-}
+const snapshot = () => ({ ...state });
 
 function broadcast(msg) {
   for (const port of subscribers) {
@@ -73,9 +75,7 @@ async function loadModel(modelId) {
     const models = await listModels();
     const record = models.find((m) => m.model_id === modelId);
     if (!record) {
-      throw new Error(
-        `Model "${modelId}" is not registered. Drop its folder on the manager page first.`,
-      );
+      throw new Error(`Model "${modelId}" is not registered. Drop its folder on the manager page first.`);
     }
 
     const { ok, missing } = await verifyModelCache(record);
@@ -85,30 +85,70 @@ async function loadModel(modelId) {
       );
     }
 
-    setState({ status: ENGINE_STATE.LOADING, modelId, error: null, progress: { text: "Starting", progress: 0 } });
-
-    if (engine) {
-      await engine.unload().catch(() => {});
-      engine = null;
-    }
-
-    const { CreateMLCEngine } = await import("../../vendor/web-llm.js");
-    engine = await CreateMLCEngine(modelId, {
-      appConfig: toAppConfig(models),
-      initProgressCallback: (report) => {
-        setState({ progress: { text: report.text, progress: report.progress } });
-      },
+    const { engineCount, decodeSteps } = await getSettings();
+    setState({
+      status: ENGINE_STATE.LOADING,
+      modelId,
+      error: null,
+      progress: { text: "Starting", progress: 0 },
     });
 
-    setState({ status: ENGINE_STATE.READY, modelId, progress: null, error: null });
+    if (pool) {
+      await pool.unload();
+      pool = null;
+    }
+
+    const { CreateWebWorkerMLCEngine } = await import("../../vendor/web-llm.js");
+    const appConfig = toAppConfig(models);
+
+    pool = new EnginePool({
+      size: engineCount,
+      createEngine: async (_index, onProgress) => {
+        const worker = new Worker(browser.runtime.getURL("src/background/engine-worker.js"), {
+          type: "module",
+        });
+        // Listener, not `onmessage`: WebLLM claims `onmessage` for its own RPC.
+        worker.addEventListener("message", (event) => {
+          if (event.data?.ewgpuStats) setState({ decode: event.data.ewgpuStats });
+        });
+        // Sent before WebLLM's own handshake so the first token already decodes
+        // multi-step; worker message order guarantees it arrives first.
+        worker.postMessage({ kind: WORKER_CONFIGURE, decodeSteps });
+        const engine = await CreateWebWorkerMLCEngine(worker, modelId, {
+          appConfig,
+          initProgressCallback: onProgress,
+        });
+        // The worker owns the decode loop, so runtime knobs go straight to it
+        // rather than through WebLLM's request path.
+        engine.configure = (patch) => worker.postMessage({ kind: WORKER_CONFIGURE, ...patch });
+        // Tear the realm down with the engine, not just the model.
+        const unloadEngine = engine.unload.bind(engine);
+        engine.unload = async () => {
+          await unloadEngine().catch(() => {});
+          worker.terminate();
+        };
+        return engine;
+      },
+      onStateChange: (poolState) => setState({ pool: poolState }),
+    });
+
+    await pool.load((progress) => setState({ progress }));
+
+    setState({ status: ENGINE_STATE.READY, modelId, progress: null, error: null, pool: pool.status() });
     return snapshot();
   })();
 
   try {
     return await loading;
   } catch (err) {
-    engine = null;
-    setState({ status: ENGINE_STATE.ERROR, modelId: null, progress: null, error: String(err.message ?? err) });
+    pool = null;
+    setState({
+      status: ENGINE_STATE.ERROR,
+      modelId: null,
+      progress: null,
+      error: String(err.message ?? err),
+      pool: { size: 0, busy: 0, queued: 0 },
+    });
     throw err;
   } finally {
     loading = null;
@@ -116,24 +156,30 @@ async function loadModel(modelId) {
 }
 
 async function unloadModel() {
-  if (engine) await engine.unload().catch(() => {});
-  engine = null;
-  setState({ status: ENGINE_STATE.IDLE, modelId: null, progress: null, error: null, busy: false });
+  if (pool) await pool.unload();
+  pool = null;
+  setState({
+    status: ENGINE_STATE.IDLE,
+    modelId: null,
+    progress: null,
+    error: null,
+    pool: { size: 0, busy: 0, queued: 0 },
+  });
   return snapshot();
 }
 
 /** Loads on demand so callers can just ask for a completion. */
-async function engineFor(modelId) {
+async function ensurePool(modelId) {
   if (modelId && modelId !== state.modelId) await loadModel(modelId);
-  if (!engine) {
+  if (!pool) {
     const fallback = modelId ?? state.modelId ?? (await listModels())[0]?.model_id;
     if (!fallback) throw new Error("No local model is registered yet.");
     await loadModel(fallback);
   }
-  return engine;
+  return pool;
 }
 
-async function buildRequest(payload) {
+async function buildParams(payload) {
   const settings = await getSettings();
   const messages = Array.isArray(payload.messages) ? [...payload.messages] : [];
   if (messages.length === 0) throw new Error("`messages` must be a non-empty array.");
@@ -145,50 +191,89 @@ async function buildRequest(payload) {
     temperature: payload.temperature ?? settings.temperature,
     max_tokens: payload.max_tokens ?? settings.maxTokens,
     ...(payload.response_format ? { response_format: payload.response_format } : {}),
+    ...(payload.extra_body ? { extra_body: payload.extra_body } : {}),
   };
 }
 
-async function chat(payload) {
-  if (state.busy) throw new Error("Engine is busy with another generation.");
-  const eng = await engineFor(payload.modelId);
-  setState({ busy: true });
-  try {
-    const reply = await eng.chat.completions.create({ ...(await buildRequest(payload)), stream: false });
-    return { completion: reply, text: reply.choices?.[0]?.message?.content ?? "" };
-  } finally {
-    setState({ busy: false });
-  }
+/** Scheduling metadata is per-request; the pool, not the caller, acts on it. */
+function scheduling(payload) {
+  return {
+    session: payload.session,
+    priority: payload.priority ?? PRIORITY.NORMAL,
+    preemptible: payload.preemptible,
+  };
 }
 
-async function streamChat(port, payload) {
-  const id = payload.id ?? crypto.randomUUID();
-  try {
-    if (state.busy) throw new Error("Engine is busy with another generation.");
-    const eng = await engineFor(payload.modelId);
-    setState({ busy: true });
-    try {
-      const stream = await eng.chat.completions.create({
-        ...(await buildRequest(payload)),
-        stream: true,
-        stream_options: { include_usage: true },
-      });
-      let text = "";
-      let usage = null;
-      for await (const chunk of stream) {
-        const delta = chunk.choices?.[0]?.delta?.content ?? "";
-        if (delta) {
-          text += delta;
-          port.postMessage({ protocol: PROTOCOL, op: PORT_OP.CHUNK, id, delta });
-        }
-        if (chunk.usage) usage = chunk.usage;
-      }
-      port.postMessage({ protocol: PROTOCOL, op: PORT_OP.DONE, id, text, usage });
-    } finally {
-      setState({ busy: false });
-    }
-  } catch (err) {
-    port.postMessage({ protocol: PROTOCOL, op: PORT_OP.ERROR, id, error: String(err.message ?? err) });
+function unwrap(result) {
+  if (result.error) throw new Error(result.error);
+  return result;
+}
+
+async function chat(payload, onChunk) {
+  const p = await ensurePool(payload.modelId);
+  const result = unwrap(
+    await p.submit({ ...scheduling(payload), id: payload.id, params: await buildParams(payload), onChunk }),
+  );
+  return {
+    text: result.text,
+    usage: result.usage,
+    ...(result.cancelled ? { cancelled: true } : {}),
+    ...(result.preempted ? { preempted: true } : {}),
+  };
+}
+
+/**
+ * Independent prompts, fanned across the pool. This is the only way to beat the
+ * ~10 tok/s single-stream ceiling, so anything embarrassingly parallel
+ * (translating a page, labelling a list) should arrive here rather than as a
+ * loop of `chat` calls.
+ */
+async function batch(payload, onItem = () => {}) {
+  const requests = payload.requests;
+  if (!Array.isArray(requests) || requests.length === 0) {
+    throw new Error("`requests` must be a non-empty array.");
   }
+  const p = await ensurePool(payload.modelId);
+  const sched = scheduling(payload);
+
+  return Promise.all(
+    requests.map(async (req, index) => {
+      const merged = { ...payload, ...req, requests: undefined };
+      const result = await p.submit({
+        ...sched,
+        ...scheduling(merged),
+        session: req.session, // a batch shares no session unless an item names one
+        params: await buildParams(merged),
+      });
+      const item = {
+        index,
+        engineIndex: result.engineIndex,
+        startedAt: result.startedAt,
+        finishedAt: result.finishedAt,
+        ...(result.error
+          ? { error: result.error }
+          : { text: result.text, usage: result.usage, ...(result.cancelled ? { cancelled: true } : {}) }),
+      };
+      onItem(item);
+      return item;
+    }),
+  );
+}
+
+/**
+ * Applies a runtime knob to the running pool and persists it as the default.
+ *
+ * `decodeSteps` is the multi-step decode width (README, "Multi-step decoding").
+ * It takes effect on the next burst — no reload — which is what makes sweeping
+ * it to find this machine's tick boundary cheap.
+ */
+async function configure(payload) {
+  const patch = {};
+  if (payload.decodeSteps !== undefined) patch.decodeSteps = clampSteps(payload.decodeSteps);
+  if (Object.keys(patch).length === 0) throw new Error("`configure` needs at least one setting.");
+  await setSettings(patch);
+  const engines = pool?.configure(patch) ?? 0;
+  return { settings: patch, engines };
 }
 
 // --------------------------------------------------------------- routing ----
@@ -208,6 +293,12 @@ async function handle(msg) {
       return { ok: true, state: await unloadModel() };
     case OP.CHAT:
       return { ok: true, ...(await chat(msg)) };
+    case OP.BATCH:
+      return { ok: true, results: await batch(msg) };
+    case OP.CANCEL:
+      return { ok: true, cancelled: pool?.cancel(msg.id ?? msg.session) ?? 0 };
+    case OP.CONFIGURE:
+      return { ok: true, ...(await configure(msg)) };
     default:
       throw new Error(`Unknown op "${msg.op}".`);
   }
@@ -247,30 +338,44 @@ function attachPort(port) {
   port.onDisconnect.addListener(() => subscribers.delete(port));
   port.postMessage({ protocol: PROTOCOL, op: PORT_OP.ENGINE_STATE, state: snapshot() });
 
+  const send = (msg) => {
+    try {
+      port.postMessage(msg);
+    } catch {
+      /* port closed mid-stream */
+    }
+  };
+
   port.onMessage.addListener(async (msg) => {
+    const id = msg?.id;
     try {
       if (!msg || msg.protocol !== PROTOCOL) throw new Error(`Expected protocol "${PROTOCOL}".`);
       switch (msg.op) {
         case PORT_OP.SUBSCRIBE:
-          port.postMessage({ protocol: PROTOCOL, op: PORT_OP.ENGINE_STATE, state: snapshot() });
-          return;
-        case PORT_OP.CHAT_STREAM:
-          await streamChat(port, msg);
-          return;
+          return send({ protocol: PROTOCOL, op: PORT_OP.ENGINE_STATE, state: snapshot() });
+
+        case PORT_OP.CHAT_STREAM: {
+          const result = await chat(msg, (delta) =>
+            send({ protocol: PROTOCOL, op: PORT_OP.CHUNK, id, delta }),
+          );
+          return send({ protocol: PROTOCOL, op: PORT_OP.DONE, id, ...result });
+        }
+
+        case PORT_OP.BATCH_STREAM: {
+          const results = await batch(msg, (item) =>
+            send({ protocol: PROTOCOL, op: PORT_OP.ITEM, id, ...item }),
+          );
+          return send({ protocol: PROTOCOL, op: PORT_OP.DONE, id, results });
+        }
+
         case PORT_OP.ABORT:
-          engine?.interruptGenerate();
-          return;
+          return void (pool?.cancel(msg.session ?? id) ?? 0);
+
         default:
-          // Request/response ops are accepted over the port too, for convenience.
-          port.postMessage({ protocol: PROTOCOL, op: msg.op, id: msg.id, ...(await respond(msg)) });
+          return send({ protocol: PROTOCOL, op: msg.op, id, ...(await respond(msg)) });
       }
     } catch (err) {
-      port.postMessage({
-        protocol: PROTOCOL,
-        op: PORT_OP.ERROR,
-        id: msg?.id,
-        error: String(err.message ?? err),
-      });
+      send({ protocol: PROTOCOL, op: PORT_OP.ERROR, id, error: String(err.message ?? err) });
     }
   });
 }

@@ -5,9 +5,10 @@
   "scripts": {
     "build": "node build.mjs",
     "check": "node build.mjs --check-entries",
-    "test": "node --test test/integration.test.mjs",
+    "test": "node --test test/integration.test.mjs test/scheduler.test.mjs test/multistep.test.mjs",
     "package": "npm run build && node build.mjs --zip",
-    "e2e": "node test/e2e/run.mjs"
+    "e2e": "node test/e2e/run.mjs",
+    "bench": "node test/e2e/bench.mjs"
   },
   "author": "",
   "license": "ISC",

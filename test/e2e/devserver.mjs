@@ -10,7 +10,7 @@ const CORS = {
   "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
 };
 
-export function startServer({ dir, port, onReport }) {
+export function startServer({ dir, port, onReport, engineCount, decodeStepsSweep, skipBench }) {
   const server = createServer(async (req, res) => {
     if (req.method === "OPTIONS") return res.writeHead(204, CORS).end();
 
@@ -20,7 +20,9 @@ export function startServer({ dir, port, onReport }) {
         names.map(async (name) => ({ name, size: (await stat(join(dir, name))).size })),
       );
       res.writeHead(200, { ...CORS, "content-type": "application/json" });
-      return res.end(JSON.stringify({ folder: basename(dir), files }));
+      return res.end(
+        JSON.stringify({ folder: basename(dir), files, engineCount, decodeStepsSweep, skipBench }),
+      );
     }
 
     if (req.url?.startsWith("/files/")) {

@@ -13,15 +13,16 @@
  * self-test page into src/devtest/, points the background page at it, and
  * restores both in a finally block.
  */
-import { spawn } from "node:child_process";
-import { cpSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { execFileSync, spawn } from "node:child_process";
+import { cpSync, existsSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 import { startServer } from "./devserver.mjs";
 
 const PORT = 8787;
-const TIMEOUT_MS = 5 * 60_000;
+// A large pool loads in waves, so give it room: 4 engines is ~2x a single load.
+const TIMEOUT_MS = 10 * 60_000;
 const ROOT = resolve(import.meta.dirname, "../..");
 const MODEL_DIR = (process.env.MODEL_DIR ?? join(homedir(), "Downloads", "Qwen3.5-0.8B-q4f16_1-MLC"))
   .replace(/^~/, homedir());
@@ -36,17 +37,59 @@ if (!existsSync(MODEL_DIR)) {
   process.exit(1);
 }
 
-const manifestBefore = readFileSync(MANIFEST, "utf8");
-const bgBefore = readFileSync(BG_HTML, "utf8");
+/**
+ * Snapshot the *clean* tree. A run killed mid-flight leaves the patches behind,
+ * so strip them first - otherwise the dirty state becomes the restore target.
+ */
+function unpatch(manifestSrc, bgSrc) {
+  const manifest = JSON.parse(manifestSrc);
+  manifest.permissions = manifest.permissions.filter((p) => !p.startsWith("http://127.0.0.1"));
+  return {
+    manifest: JSON.stringify(manifest, null, 2) + "\n",
+    bg: bgSrc.split("\n").filter((l) => !l.includes("devtest")).join("\n"),
+  };
+}
+
+const clean = unpatch(readFileSync(MANIFEST, "utf8"), readFileSync(BG_HTML, "utf8"));
+const manifestBefore = clean.manifest;
+const bgBefore = clean.bg;
 let firefox;
 let server;
+
+/**
+ * web-ext builds a throwaway Firefox profile per run and never removes it. With
+ * the model cached inside, that is ~600 MB a run — enough to fill a disk in a
+ * dozen runs, and a full disk shows up as an e2e that mysteriously times out
+ * rather than as a disk error. Killing web-ext does not reap Firefox either, so
+ * both are cleaned here.
+ */
+function reapFirefoxProfiles() {
+  for (const name of readdirSync(tmpdir())) {
+    if (!name.startsWith("firefox-profile")) continue;
+    const path = join(tmpdir(), name);
+    try {
+      // Leave anything a live Firefox still has open; a later run collects it.
+      if (Date.now() - statSync(path).mtimeMs < 5000) continue;
+      rmSync(path, { recursive: true, force: true });
+    } catch {
+      /* another run owns it */
+    }
+  }
+}
 
 function restore() {
   writeFileSync(MANIFEST, manifestBefore);
   writeFileSync(BG_HTML, bgBefore);
   rmSync(DEVTEST_DIR, { recursive: true, force: true });
   firefox?.kill("SIGTERM");
+  // web-ext is the parent; Firefox itself outlives it unless killed by profile.
+  try {
+    execFileSync("pkill", ["-f", "firefox-profile"], { stdio: "ignore" });
+  } catch {
+    /* nothing left running */
+  }
   server?.close();
+  reapFirefoxProfiles();
 }
 
 try {
@@ -59,7 +102,27 @@ try {
 
   let onReport;
   const report = new Promise((res) => (onReport = res));
-  server = await startServer({ dir: MODEL_DIR, port: PORT, onReport: (r) => onReport(r) });
+  server = await startServer({
+    dir: MODEL_DIR,
+    port: PORT,
+    engineCount: process.env.ENGINE_COUNT ? Number(process.env.ENGINE_COUNT) : undefined,
+    // DECODE_STEPS="1,4,8,13,15" sweeps multi-step widths on one loaded model.
+    // The interesting values straddle a 100 ms tick: see README, "Multi-step
+    // decoding". Unset means "just use the configured default".
+    decodeStepsSweep: process.env.DECODE_STEPS
+      ? process.env.DECODE_STEPS.split(",").map((n) => Number(n.trim())).filter(Boolean)
+      : undefined,
+    // SKIP_BENCH=1 drops the two ~40 s gpuBench passes. Worth it when the run is
+    // being used to compare two builds rather than to characterise the GPU.
+    skipBench: Boolean(process.env.SKIP_BENCH),
+    onReport: (r) => {
+      if (r.kind === "bench") {
+        console.log(`  [bench] ${r.where}: ${Object.entries(r.bench).map(([k, v]) => `${k}=${v}`).join(" ")}`);
+        return;
+      }
+      onReport(r);
+    },
+  });
 
   console.log(`serving ${MODEL_DIR} on :${PORT}; launching Firefox…`);
   firefox = spawn(
@@ -69,9 +132,13 @@ try {
      "--source-dir", ROOT,
      "--ignore-files", "node_modules/**", "test/**", "*.xpi", "build.mjs",
      "--no-input", "--no-reload",
+     ...(process.env.PROFILE_PATH ? ["--profile-path", process.env.PROFILE_PATH, "--keep-profile-changes"] : []),
      "--pref", "dom.webgpu.enabled=true",
      "--pref", "gfx.webgpu.ignore-blocklist=true"],
-    { cwd: ROOT, stdio: "ignore" },
+    // E2E_VERBOSE=1 surfaces web-ext's and Firefox's own output. Without it a
+    // failed launch is indistinguishable from a hung extension: both just time
+    // out with nothing printed.
+    { cwd: ROOT, stdio: process.env.E2E_VERBOSE ? "inherit" : "ignore" },
   );
 
   const result = await Promise.race([

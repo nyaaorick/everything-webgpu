@@ -1,5 +1,5 @@
 /** Minimal test chat. Thin client over the background engine host's port protocol. */
-import { ENGINE_STATE, OP, PORT_NAME, PORT_OP, PROTOCOL, request } from "../lib/protocol.js";
+import { ENGINE_STATE, OP, PORT_NAME, PORT_OP, PRIORITY, PROTOCOL, request } from "../lib/protocol.js";
 
 const $ = (id) => document.getElementById(id);
 const els = {
@@ -9,7 +9,7 @@ const els = {
 };
 
 const history = [];
-let engineState = { status: ENGINE_STATE.IDLE, modelId: null, busy: false };
+let engineState = { status: ENGINE_STATE.IDLE, modelId: null, pool: null };
 let streamId = null;
 let streamEl = null;
 
@@ -19,7 +19,7 @@ port.onMessage.addListener(onPortMessage);
 // -------------------------------------------------------------- rendering ---
 
 function renderState() {
-  const { status, modelId, progress, error, busy } = engineState;
+  const { status, modelId, progress, error, pool } = engineState;
   els.dot.className = `dot ${status}`;
   els.progress.style.width = `${Math.round((progress?.progress ?? (status === ENGINE_STATE.READY ? 1 : 0)) * 100)}%`;
 
@@ -29,6 +29,9 @@ function renderState() {
     status === ENGINE_STATE.READY ? `Ready — ${modelId}` :
     status === ENGINE_STATE.LOADING ? `Loading ${modelId}…` :
     "Idle — pick a model and press Load";
+  if (!error && status === ENGINE_STATE.READY && pool && (pool.busy || pool.queued)) {
+    els.status.textContent += ` · ${pool.busy}/${pool.size} busy, ${pool.queued} queued`;
+  }
   els.status.classList.toggle("banner", Boolean(error));
   els.status.classList.toggle("error", Boolean(error));
 
@@ -36,7 +39,7 @@ function renderState() {
   els.load.disabled = loading || !els.model.value;
   els.unload.disabled = loading || status !== ENGINE_STATE.READY;
   els.model.disabled = loading;
-  els.send.disabled = loading || busy || streamId !== null;
+  els.send.disabled = loading || streamId !== null;
   els.stop.hidden = streamId === null;
   els.load.textContent = status === ENGINE_STATE.READY && modelId === els.model.value ? "Reload" : "Load";
 }
@@ -98,6 +101,8 @@ function send() {
     id: streamId,
     modelId: els.model.value || undefined,
     messages: history,
+    priority: PRIORITY.INTERACTIVE,
+    session: "popup",
   });
 }
 
@@ -150,7 +155,7 @@ els.load.addEventListener("click", () =>
 els.unload.addEventListener("click", () => ask(OP.UNLOAD).catch(() => {}));
 els.send.addEventListener("click", send);
 els.stop.addEventListener("click", () =>
-  port.postMessage({ protocol: PROTOCOL, op: PORT_OP.ABORT, id: streamId }),
+  port.postMessage({ protocol: PROTOCOL, op: PORT_OP.ABORT, id: streamId, session: "popup" }),
 );
 els.clear.addEventListener("click", () => {
   history.length = 0;

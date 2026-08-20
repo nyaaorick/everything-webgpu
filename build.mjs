@@ -32,6 +32,11 @@ if (!flag("--check-entries") && !flag("--zip")) {
     logLevel: "info",
   });
   patchStorageBufferLimit();
+  if (process.env.NO_PASS_MERGE) {
+    console.log("skipped compute-pass batching (NO_PASS_MERGE set)");
+  } else {
+    patchComputePassBatching();
+  }
 }
 
 /**
@@ -57,6 +62,71 @@ function patchStorageBufferLimit() {
   }
   writeFileSync(path, src.replace(before, after));
   console.log("applied Firefox storage-buffer limit shim");
+}
+
+/**
+ * Batch consecutive kernel launches into one WebGPU compute pass.
+ *
+ * tvmjs opens a fresh pass per kernel launch (`submitShader`: beginComputePass ->
+ * setPipeline -> createBindGroup -> dispatch -> end). Measured on an M4 Air
+ * (README, "Where the 46 ms goes"), that is the dominant cost of decode:
+ *
+ *   - a compute *pass* costs ~100 us; a dispatch inside one is free
+ *     (`npm run bench`: 2048 dispatches = 104 ms in one pass, 309 ms in 2048)
+ *   - decode issues 664 kernels/token but only 16 flushes/token, so ~41
+ *     consecutive launches share an encoder and are each paying for their own
+ *     pass for no reason
+ *
+ * Dispatches within one pass are safe to merge: WebGPU gives a compute pass a
+ * usage scope *per dispatch*, so implementations must insert barriers between
+ * them. The bench shader confirms it — 2048 dispatches with a genuine
+ * read-after-write hazard on one buffer still measured free.
+ *
+ * The pass is closed in `flushCommands()`, which is already the single
+ * chokepoint every operation that cannot run mid-pass (buffer copies, frees,
+ * submits, sync) routes through.
+ *
+ * Set NO_PASS_MERGE=1 to build without this, for an A/B on one machine.
+ */
+function patchComputePassBatching() {
+  const path = "vendor/web-llm.js";
+  /** Cap so one pass can never grow unbounded; 41/flush is the measured norm. */
+  const maxDispatchesPerPass = 1024;
+  const edits = [
+    // Reuse the open pass instead of beginning one per launch.
+    [
+      "const compute = this.pendingEncoder.beginComputePass();",
+      "if (!this.pendingComputePass) { this.pendingComputePass = this.pendingEncoder.beginComputePass(); } " +
+        "const compute = this.pendingComputePass;",
+    ],
+    // Do not end it per launch; only guard against an unbounded pass.
+    [
+      "compute.end();",
+      `if (this.pendingDispatchCount >= ${maxDispatchesPerPass}) this.flushCommands();`,
+    ],
+    // Close it exactly where the encoder is submitted.
+    [
+      "this.device.queue.submit([this.pendingEncoder.finish()]);",
+      "if (this.pendingComputePass) { this.pendingComputePass.end(); this.pendingComputePass = null; } " +
+        "this.device.queue.submit([this.pendingEncoder.finish()]);",
+    ],
+  ];
+
+  let src = readFileSync(path, "utf8");
+  for (const [before, after] of edits) {
+    // Each anchor is unique in the bundle; if that stops holding, the patch
+    // could land in the wrong place, so refuse rather than guess.
+    const hits = src.split(before).length - 1;
+    if (hits !== 1) {
+      throw new Error(
+        `${path}: compute-pass batching expected exactly 1 match for ${JSON.stringify(before)}, found ${hits}. ` +
+          "WebLLM changed tvmjs's WebGPUContext - re-check build.mjs, or build with NO_PASS_MERGE=1.",
+      );
+    }
+    src = src.replace(before, after);
+  }
+  writeFileSync(path, src);
+  console.log(`applied compute-pass batching (max ${maxDispatchesPerPass} dispatches/pass)`);
 }
 
 if (flag("--check-entries")) {

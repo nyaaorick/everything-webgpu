@@ -29,6 +29,24 @@ const SETTINGS_KEY = "settings";
 export const DEFAULT_SETTINGS = {
   /** Empty list = every installed extension may call the API. */
   allowedExternalIds: [],
+  /**
+   * Engines held in the pool. Each is a full copy of the weights in VRAM and a
+   * full load, but concurrent generations each get their own ~10 tok/s, so this
+   * is the only dial that raises total throughput. 2 is the smallest number
+   * that delivers any parallelism at all.
+   */
+  engineCount: 2,
+  /**
+   * Forward steps per GPU->CPU sync (vLLM's `--num-scheduler-steps`). Decode is
+   * sync-bound, not compute-bound, so this is the only dial that raises
+   * *single-stream* throughput — `engineCount` raises aggregate throughput.
+   *
+   * 15 is vLLM's documented cap and this extension's default. Unlike vLLM the
+   * win here is quantized by Firefox's 100 ms poll, so the best value is the
+   * largest K whose burst still fits inside one tick, and it shrinks as the
+   * model grows. See src/background/multistep.js and `npm run e2e -- --steps`.
+   */
+  decodeSteps: 15,
   temperature: 0.7,
   maxTokens: 1024,
   systemPrompt: "",

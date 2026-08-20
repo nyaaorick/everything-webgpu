@@ -35,3 +35,5 @@ code { font-family: "SF Mono", ui-monospace, Menlo, monospace; }
 .pill { padding: 2px 7px; border-radius: 99px; font-size: 10px; border: 1px solid var(--line); }
 .pill.ok { color: var(--ok); border-color: var(--ok); }
 .pill.bad { color: var(--danger); border-color: var(--danger); }
+
+.warn { color: #ffb454; }
