@@ -130,7 +130,7 @@ try {
     ["--yes", "web-ext@8", "run",
      "--firefox", FIREFOX,
      "--source-dir", ROOT,
-     "--ignore-files", "node_modules/**", "test/**", "*.xpi", "build.mjs",
+     "--ignore-files", "node_modules/**", "test/**", "*.xpi", "build.mjs", "model/**", "dist/**", "tools/**",
      "--no-input", "--no-reload",
      ...(process.env.PROFILE_PATH ? ["--profile-path", process.env.PROFILE_PATH, "--keep-profile-changes"] : []),
      "--pref", "dom.webgpu.enabled=true",

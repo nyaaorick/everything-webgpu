@@ -10,7 +10,7 @@
  */
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -79,6 +79,9 @@ const result = await Promise.race([
 
 firefox.kill("SIGTERM");
 server.close();
+// The profile is per-run and holds nothing worth keeping. Without this the
+// bench leaks ~120 MB every invocation; 18 runs had piled up 2.1 GB.
+rmSync(profile, { recursive: true, force: true });
 
 console.log(`\n${result.where ?? "plain page"}:`);
 console.log(result.error ?? Object.entries(result.bench).map(([k, v]) => `  ${k} = ${v}`).join("\n"));

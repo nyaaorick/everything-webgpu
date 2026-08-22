@@ -67,6 +67,50 @@ const multiStep = installMultiStepDecoding(handler.engine, {
   },
 });
 
+/**
+ * Force a full re-prefill instead of reusing the KV cache across rounds.
+ *
+ * Multi-round reuse routes attention through `batch_prefill_paged_kv_kernel`,
+ * which binds 10 storage buffers: q, pages, lse, output and six small i32
+ * metadata arrays. Firefox's Metal backend caps `maxStorageBuffersPerShaderStage`
+ * at 9, so that pipeline fails to build — and an invalid WebGPU pipeline is
+ * silent, its dispatches becoming no-ops. The symptom is a second turn that
+ * answers the *previous* question behind a garbage prefix that differs run to
+ * run, which is uninitialised memory being read.
+ *
+ * Resetting the conversation first makes WebLLM's own conversation comparison
+ * fail, so it re-prefills from scratch through `batch_prefill_ragged_kv_kernel`
+ * (9 bindings, works). The cost is re-reading the history each turn; prefill is
+ * one sync per chunk, so it is far cheaper than the garbage it replaces.
+ *
+ * Conditional on the limit, not on the browser: a device that allows 10 keeps
+ * the KV cache and the faster path.
+ */
+/** Bindings `batch_prefill_paged_kv_kernel` needs; see tools/audit-wasm.mjs. */
+const PAGED_PREFILL_STORAGE_BUFFERS = 10;
+
+/** Whether this device is too tight to build that pipeline. Probed once. */
+const kvReuseUnsafe = (async () => {
+  const adapter = await navigator.gpu?.requestAdapter().catch(() => null);
+  const limit = adapter?.limits?.maxStorageBuffersPerShaderStage ?? 0;
+  const unsafe = limit < PAGED_PREFILL_STORAGE_BUFFERS;
+  if (unsafe) {
+    console.info(
+      `[everything-webgpu] KV reuse disabled: paged prefill needs ` +
+        `${PAGED_PREFILL_STORAGE_BUFFERS} storage buffers, this device allows ${limit}`,
+    );
+  }
+  return unsafe;
+})();
+
+// Wrapped synchronously at module load: deciding first and wrapping after the
+// await would leave a window where an early prefill slips through unguarded.
+const basePrefill = handler.engine.prefill.bind(handler.engine);
+handler.engine.prefill = async (input, pipeline, chatConfig, genConfig) => {
+  if (await kvReuseUnsafe) pipeline.resetChat(/* keepStats= */ true);
+  return basePrefill(input, pipeline, chatConfig, genConfig);
+};
+
 // The engine is reachable before any model is loaded, so the host can set the
 // step count on the very first message and never has to reload to change it.
 self.onmessage = (msg) => {
