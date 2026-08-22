@@ -198,6 +198,7 @@ async function buildParams(payload) {
 /** Scheduling metadata is per-request; the pool, not the caller, acts on it. */
 function scheduling(payload) {
   return {
+    task: payload.task,
     session: payload.session,
     priority: payload.priority ?? PRIORITY.NORMAL,
     preemptible: payload.preemptible,
@@ -235,6 +236,10 @@ async function batch(payload, onItem = () => {}) {
   }
   const p = await ensurePool(payload.modelId);
   const sched = scheduling(payload);
+  // One batch is one task, however many requests it is: "translate this page"
+  // should hold one engine, not every engine. The pool reserves its last free
+  // slot for a different task, so ghost-text never queues behind the page.
+  const task = payload.task ?? `batch-${payload.id ?? crypto.randomUUID()}`;
 
   return Promise.all(
     requests.map(async (req, index) => {
@@ -243,6 +248,8 @@ async function batch(payload, onItem = () => {}) {
         ...sched,
         ...scheduling(merged),
         session: req.session, // a batch shares no session unless an item names one
+        // An item that names its own session is its own task again.
+        task: req.task ?? req.session ?? task,
         params: await buildParams(merged),
       });
       const item = {
