@@ -47,7 +47,14 @@ export const DEFAULT_SETTINGS = {
    * model grows. See src/background/multistep.js and `npm run e2e -- --steps`.
    */
   decodeSteps: 15,
-  temperature: 0.7,
+  /**
+   * `buildParams` puts this on every request, so it shadows whatever
+   * `mlc-chat-config.json` ships as the model's own default — unlike `top_p`,
+   * which is never injected and so comes from the model. 0.6 is what the
+   * Qwen3.8-2B-Distill card asks for; reasoning models in this class are prone
+   * to repetition loops when decoding is too close to greedy.
+   */
+  temperature: 0.6,
   maxTokens: 1024,
   systemPrompt: "",
 };

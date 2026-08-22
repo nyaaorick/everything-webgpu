@@ -3,3 +3,8 @@ vendor/
 *.xpi
 .DS_Store
 web-ext-artifacts/
+# Source checkpoints for in-house compilation (GBs).
+model/
+dist/
+# In-house MLC toolchain venv (GBs; rebuild with tools/setup-mlc-toolchain.sh).
+.venv-mlc/
