@@ -1,9 +1,9 @@
-# Everything WebGPU
-
-# AI.md - Project Harness
+# Everything WebGPU — project harness
 
 ## Project Vision
-A lightweight, zero-download Firefox WebExtension optimized for macOS (WebGPU/Metal) that runs local 4B+ LLMs via WebLLM using drag-and-drop local model caching. It serves as a unified local AI engine, providing a minimal test chat UI and exposing an internal API bridge for other Firefox extensions (e.g., translation, code completion).
+A lightweight, zero-download Firefox WebExtension optimized for macOS (WebGPU/Metal) that runs local LLMs via WebLLM using drag-and-drop local model caching. It serves as a unified local AI engine, providing a minimal test chat UI and exposing an internal API bridge for other Firefox extensions (e.g., translation, code completion).
+
+**Model: `empero-ai/Qwen3.8-2B-Distill`, compiled to MLC in-house — done and running at 16.6-18.1 tok/s.** The original "4B+" goal was set before decode was instrumented; the measurements retired it. Decode is memory-bandwidth-bound, so time per token scales with weight bytes: a 4B at `q4f16_1` is ~2.25 GB and projects to 7-9 tok/s with only one engine fitting in 16 GB, while this 2B is 1.06 GB and was projected at 14-18 tok/s — the measurement landed inside that band. Build notes and the toolchain fixes are in [MLC-COMPILE.md](MLC-COMPILE.md).
 
 ## Workflow & Development Principles
 - **Fail Fast**: Validate inputs, model states, and cache availability early. Throw descriptive errors immediately upon invalid conditions.
@@ -12,11 +12,18 @@ A lightweight, zero-download Firefox WebExtension optimized for macOS (WebGPU/Me
 - **Direct Execution**: Output exact code changes or direct answers. Omit preamble, pleasantries, conversational fillers, and unsolicited caveats.
 
 ## Current Tasks
-- [ ] Try a 4B model — 0.8B is verified, but the vision target is 4B+. Re-measure the pool (two 4B engines is ~8 GB of weights) *and* re-sweep `decodeSteps`: the best K falls as per-step compute rises.
+
+**Track 1 — decode efficiency.** The one measured, unclaimed win.
+- [ ] Retune the dlight GEMV schedule: more work per thread before the reduction. Measured payoff of 2 -> 32 iters/thread is **1.83x** in isolation, which would put decode near the ~41 GB/s dequant ceiling. Confirmed still untaken on the 2B build — the e2e's `decode probe` reports 639 forward kernels over 24 layers (~27 per layer), the same shape as the 0.8B. Needs a recompile; the toolchain is stood up (`tools/setup-mlc-toolchain.sh`).
+
+**Track 2 — engine work, independent of the model**
+- [ ] Batched decode. The model lib already exports `batch_decode` / `batch_prefill` / `batch_verify` and a paged KV cache; WebLLM hardcodes `defaultMaxNumSequence = 1`, `numSamples = 1`. Lifting that reads the weights once per step for N sequences — projected ~4x on the `batch` API. **No recompilation needed**, and it is now the *only* route to concurrent throughput: a second engine measured 1.06x on this model (see "Scheduling").
+- [ ] Per-priority `decodeSteps`. K=15 maximises throughput but emits 15 tokens every ~583 ms, which reads as a stall; `interactive` should use K=2-4, `background`/`batch` K=32.
+- [ ] Restore cross-turn KV reuse. Every turn currently re-prefills the whole history at a measured **5.27 ms per token**, so a turn near the 4096 context limit pays ~22 s before its first token. The fix is packing `batch_prefill_paged_kv_kernel`'s six i32 metadata buffers into one with offsets (10 bindings -> 5); the offsets already exist in its uniform block. See [MLC-COMPILE.md](MLC-COMPILE.md).
 - [ ] Ghost-text consumer extension (fixed 128-token context) on top of `session` + `priority: "interactive"`.
-- [ ] Install Ollama on the test machine and measure it on comparable weights. The "80% of Ollama" target is currently the only unmeasured number in the performance analysis.
-- [ ] Recompile the model lib with a retuned dlight GEMV schedule (more work per thread before the reduction). Measured payoff of 2 -> 32 iters/thread is 1.83x in isolation, which would put decode near the ~41 GB/s dequant ceiling, i.e. roughly 70 tok/s. Needs the `mlc_llm` toolchain; the weights do not change.
-- [ ] Raise decode's memory-bandwidth efficiency. The remaining ~27 ms/token of forward execution moves 420 MB at ~16 GB/s, ~13% of the M4's peak; launch count is already accounted for (~2 µs x 664 = 1.3 ms). First experiment is cheap: try other quantizations of the same weights (`q4f32_1`, `q0f16`) and see whether the dequant-GEMV kernels or the raw traffic dominate.
+- [ ] Install Ollama on the test machine and measure it on comparable weights. The "80% of Ollama" target is the only unmeasured number in the performance analysis.
+- [ ] Fix `PROFILE_PATH` in [test/e2e/run.mjs](test/e2e/run.mjs): it passes `--profile-path`, but web-ext 8 calls it `--firefox-profile` and exits with `Unknown arguments`.
+- [ ] Isolate the bench's pass-sweep onto its own device. 2048 compute passes in one encoder loses the WebGPU device (`deviceLostDuringBench`), which silently no-ops every later probe in the same run.
 - [ ] Decide MV3 migration path (event pages evict the resident engine; needs a keep-alive or an engine tab).
 
 ## Completed Tasks
@@ -33,17 +40,43 @@ A lightweight, zero-download Firefox WebExtension optimized for macOS (WebGPU/Me
 - [x] Implemented multi-step decoding (vLLM's `--num-scheduler-steps`, default 15) so one GPU sync covers K tokens: 9.7 -> 18.4 tok/s single-stream.
 - [x] Instrumented decode with a CPU-encode / GPU-execute probe and root-caused the remaining ~46 ms/token to 664 per-token kernel launches, each in its own WebGPU compute pass — not the poll tick, not command encoding.
 - [x] Batched consecutive tvmjs kernel launches into one compute pass (664 passes/token -> ~16): 10.3 -> 25.9 tok/s on an identical greedy generation, byte-identical output.
+- [x] Priced the remaining gap against the platform: ~50 GB/s is the most a hand-written WGSL kernel gets here, ~16 GB/s is what the generated dequant-GEMV gets, and the difference is the reduction tail amortised over a 2-iteration loop — not load width (~1.15x) and not dequantisation (~free).
+- [x] Compiled `Qwen3.8-2B-Distill` to MLC/WebGPU in-house: vision tower and MTP head stripped, `q4f16_1`, 1.06 GB, 26 shards. Five separate breakages in the published MLC nightlies had to be worked around first — see [MLC-COMPILE.md](MLC-COMPILE.md) and `tools/`.
+- [x] Made the engine pool demand-driven: one engine at load, a second only when a second task competes, one engine per task. Measured that a second engine is worth 1.06x on this model, so it buys isolation rather than throughput.
+- [x] Surfaced the model-load report in the UI. WebLLM's text was always being passed through, but `#status` was a single ellipsised line, so it was truncated to `Loading model from cache[26/5…`.
 
 ## Consolidated Context
-- **Target Platform**: Firefox WebExtension (macOS, requiring WebGPU flags).
-- **Core Stack**: JavaScript, WebGPU, WebLLM, Cache API (for local file injection), Extension Message Passing.
+- **Target Platform**: Firefox WebExtension (macOS, requiring WebGPU flags). Test machine: M4 MacBook Air, 16 GB unified memory, ~120 GB/s.
+- **Core Stack**: JavaScript, WebGPU, WebLLM (`@mlc-ai/web-llm` 0.2.84, patched at build time), Cache API (for local file injection), Extension Message Passing.
 - **Architecture**: Background engine host + popup test UI + extension-to-extension API provider.
+- **Model**: `Qwen3.8-2B-q4f16_1` (1.06 GB), compiled in-house from `empero-ai/Qwen3.8-2B-Distill` — see [MLC-COMPILE.md](MLC-COMPILE.md). `Qwen3.5-0.8B-q4f16_1-MLC` remains the baseline most of the analysis below was measured on. Keep `q4f16_1` — dequantisation measured ~free, so wider formats only add bytes, and bytes are what decode pays for.
+- **Scheduling**: one shared GPU, one engine per task, pool grows on demand. A second engine measured 1.06x on this model, so it buys isolation rather than throughput.
+- **Build-time patches** ([build.mjs](build.mjs)): `patchStorageBufferLimit` (Firefox caps storage buffers per stage at 9, tvmjs asks for 10) and `patchComputePassBatching` (one compute pass per kernel launch -> one per flush). Both fail the build loudly if their anchors stop matching after a WebLLM upgrade; `NO_PASS_MERGE=1` skips the second for A/B.
 
 ---
 
 ## Verified
 
-`Qwen3.5-0.8B-q4f16_1-MLC` (443 MB, 11 shards), Firefox 154 release, macOS on an M4 MacBook Air:
+All numbers on an M4 MacBook Air (16 GB), Firefox 154 release, macOS.
+
+### The shipping model: `Qwen3.8-2B-q4f16_1` (1.06 GB, 26 shards)
+
+Compiled in-house; see [MLC-COMPILE.md](MLC-COMPILE.md).
+
+| | |
+| --- | --- |
+| Ingest 1.06 GB into Cache Storage | 4.8 s |
+| Model load (cache only, zero network) | 51 s |
+| Prefill | 48 tok/s short prompt, 100-200 tok/s at length |
+| **Decode** | **16.6-18.1 tok/s** |
+| Re-prefill cost per history token | 5.27 ms (no cross-turn KV reuse — see Current Tasks) |
+| Kernel launches per decoded token | 664 = 639 forward + 25 sampling, across ~16 flushes |
+| Second engine, 4-prompt batch | **1.06x** — see "Scheduling" |
+
+### The baseline it was built against: `Qwen3.5-0.8B-q4f16_1` (443 MB, 11 shards)
+
+Everything below this point was measured on the 0.8B. It is kept because it is where the
+architecture came from — the ceiling, the multi-step fix and the pass-batching fix were all found here.
 
 | | |
 | --- | --- |
@@ -71,8 +104,11 @@ Three things that surfaced from running it for real:
 - **Firefox needed a shim.** tvmjs hardcodes a request for 10 storage buffers per shader stage; Firefox's
   Metal backend caps `maxStorageBuffersPerShaderStage` at 9, so `detectGPUDevice()` threw before a device was
   ever requested. `build.mjs` clamps that request to what the adapter reports, and fails the build loudly if
-  the patch stops matching after a WebLLM upgrade. Kernels that genuinely need the 10th binding would still
-  fail at pipeline creation; this model does not.
+  the patch stops matching after a WebLLM upgrade. Kernels that genuinely need a 10th binding still fail at
+  pipeline creation — **silently**, as a no-op dispatch that emits garbage rather than an error. Both models
+  ship four such kernels; three are unreachable by config and the fourth, `batch_prefill_paged_kv_kernel`, is
+  kept off the live path by `engine-worker.js` calling `resetChat()` before every prefill when the device
+  reports fewer than 10. `node tools/audit-wasm.mjs <folder>` checks this.
 
 ### The 10 tok/s ceiling
 
@@ -338,15 +374,21 @@ The measured effective bandwidth is ~16 GB/s of the M4's ~120 GB/s, so the first
 with parameter count and quantization — not with how the layers are arranged. Extrapolating from the measured
 26 tok/s at 420 MB:
 
-| change | weight bytes | expected | why |
+| change | weight bytes | projected | why |
 | --- | --- | --- | --- |
-| another 0.8B architecture, same quant | ~420 MB | ~26 tok/s | same traffic per token; layer layout is not the variable |
-| a 4B at q4f16 | ~2.4 GB | ~6 tok/s | 6x the bytes. Even at *100%* of peak bandwidth it is ~20 ms/token = 50 tok/s |
+| another 0.8B architecture, same quant | ~450 MB | ~26 tok/s | same traffic per token; layer layout is not the variable |
+| **Qwen3.8-2B-Distill** (shipped) | 1.06 GB | **16.6-18.1 tok/s, measured** | projected 14-18; the projection held |
+| Llama-3.2-3B | ~1.7 GB | ~9 tok/s | prebuilt MLC folder exists, so no toolchain — the cheap way to sanity-check these projections |
+| a 4B at q4f16 | ~2.25 GB | ~7-9 tok/s | 5x the bytes, and only `engineCount=1` fits in 16 GB. Even at *100%* of peak it is ~19 ms/token = 53 tok/s |
 | a ~0.3B at q4f16 | ~160 MB | ~60-70 tok/s | helps, but buys less than fixing the efficiency |
 | **same weights, different quantization** | varies | see below | resolved: it changes byte count and nothing else |
 
-So: switching models does not get to 100+ tok/s, and switching to the 4B this project targets makes decode
-several times slower — that is a real cost of the vision target, worth knowing before committing to it.
+Every row except the 2B is still a projection from the measured 16.8 GB/s. The 2B row is now a measurement,
+and it landed inside its projected band — which is the only evidence available that this model of decode cost
+predicts anything.
+
+So: switching models does not get to 100+ tok/s, and going bigger costs throughput roughly in proportion to
+the extra bytes. This table is why the "4B+" goal was retired in favour of a 2B — see "Project Vision".
 100 tok/s means ~10 ms/token, which at today's 16 GB/s buys only ~160 MB of weights, but at full bandwidth
 would buy ~1.2 GB. **Closing the efficiency gap is worth ~7x more than shrinking the model.**
 
@@ -445,23 +487,109 @@ it temporarily wires a self-test page into the extension, drives ingest -> load 
 through the production code paths, and restores the tree afterwards. Re-run it after bumping
 `@mlc-ai/web-llm`.
 
+## Compiling a model in-house
+
+Done, for [`empero-ai/Qwen3.8-2B-Distill`](https://huggingface.co/empero-ai/Qwen3.8-2B-Distill). The full
+record — every command, every toolchain breakage, and the numbers — is in
+[MLC-COMPILE.md](MLC-COMPILE.md); the scripts are in `tools/`. Start with:
+
+```sh
+tools/setup-mlc-toolchain.sh          # venv, patches, emsdk, tvm web runtime
+```
+
+**Do not follow the upstream MLC quickstart.** No published pair of MLC nightlies works together, and five
+separate breakages sit between `pip install` and a loadable `.wasm` — including two that produce a model
+that compiles, ships and ingests cleanly and only fails at load. `setup-mlc-toolchain.sh` and
+`patch-mlc-nightly.py` encode all of them and are idempotent; re-run after any `pip install`.
+
+**Why this model.** The text architecture is the one already verified end to end — two dimensions differ and
+nothing else:
+
+| | Qwen3.5-0.8B (baseline) | Qwen3.8-2B-Distill (shipped) |
+| --- | --- | --- |
+| `model_type` | `qwen3_5` | `qwen3_5` |
+| layers / heads / kv-heads / head_dim | 24 / 8 / 2 / 256 | 24 / 8 / 2 / 256 |
+| `vocab_size`, `tie_word_embeddings` | 248320, true | 248320, true |
+| `linear_*`, `full_attention_interval` | 16/128/16/128/4, every 4th | identical |
+| `hidden_size` | 1024 | **2048** |
+| `intermediate_size` | 3584 | **6144** |
+
+The wider `hidden_size` also helps: the GEMV reduction is split across 64 lanes, so 1024 leaves 2 iterations
+per thread while 2048 leaves 4 and the 6144 `down_proj` leaves 12 — further along the measured efficiency
+curve (x2 = 18.6, x8 = 27.0, x32 = 34.0 GB/s) before any schedule retune.
+
+**Quantization is not a tuning knob here.** Keep `q4f16_1`: unpacking eight nibbles and scaling them measured
+~free (41 GB/s with the dequant arithmetic vs 41-46 without), so a wider format only adds bytes, and bytes are
+exactly what decode pays for. `q3f16_1` is the only faster option (~1.28x) and it costs accuracy — less than
+the 1.83x the schedule retune offers, and unlike it, not free.
+
+### Verifying a build
+
+```sh
+node tools/audit-wasm.mjs <folder>                       # storage buffers per kernel
+node tools/wasm-imports.mjs <folder>/*.wasm <known-good>/*.wasm   # runtime vs JS glue
+MODEL_DIR=<folder> ENGINE_COUNT=2 npm run e2e
+```
+
+The import check is not optional: the model library links against whatever TVM web runtime built it but runs
+against whatever tvmjs `@mlc-ai/web-llm` bundles, and a mismatch fails only at load, after everything else
+has passed. Read the e2e's `decode probe` line too — `kernels/tok ÷ 24 layers` still ≈27 means dlight chose
+more reduction threads over more work per thread and the schedule retune did not take.
+
 ## Scheduling
 
 The engine is one GPU shared by every caller, so requests carry scheduling metadata and the engine — not the
-caller — decides what runs when. Three mechanisms, no more ([src/background/pool.js](src/background/pool.js)):
+caller — decides what runs when. Four mechanisms, no more ([src/background/pool.js](src/background/pool.js)):
 
 | | |
 | --- | --- |
 | **Priority bands** | `interactive` > `normal` (default) > `background`, FIFO within a band. |
 | **Session supersession** | A new request with the same `session` cancels the previous one. This is the ghost-text primitive: each keystroke replaces the in-flight request instead of queueing behind it. |
 | **Opt-in preemption** | An `interactive` request with no free engine interrupts a running job that set `preemptible: true`. The victim resolves with its partial output and is never requeued, so nothing can starve. |
+| **One task, one engine** | Every request belongs to a `task` — a whole `batch` is one task, an unlabelled `chat` is its own. A task holds at most one engine, so two runnable tasks always run side by side whenever two engines exist. |
 
 Nothing else interrupts work in flight. A job that did not opt in always runs to completion.
 
-### The engine pool
+### Why one engine per task
 
-Each pool slot is a **Web Worker** with its own web-llm instance. That is not a nicety — several MLCEngines
-cannot share a realm. Running the same e2e three ways isolates it:
+A batch used to spread across the whole pool. On the 0.8B that was worth 1.3-2.0x, because decode was
+**sync-bound** — a stream spent most of its time waiting on Firefox's ~100 ms tick, so a second stream filled
+idle GPU. Multi-step decoding removed most of that wait, and on the 2B the remaining cost is real GPU work.
+Measured, same four prompts, greedy so both runs emit exactly 97 tokens:
+
+| pool | wall | aggregate | per item | peak overlap |
+| --- | --- | --- | --- | --- |
+| 1 | 8.2 s | 11.9 tok/s | ~2.0 s | 1 |
+| 2 | 7.7 s | 12.6 tok/s | ~3.9 s | 2 |
+
+**1.06x.** The overlap is real — busy time summed to 15.2 s against 7.7 s of wall — but each stream runs at
+half speed, so they cancel. Spreading one task over the pool buys ~nothing and costs the thing a second
+engine is actually for: a page translation would sit on both engines while ghost-text waited behind it.
+
+So the rule is flat. An engine may idle while one task still has work queued; that ~6% is deliberately given
+up to keep an engine free for whoever shows up next. `engine scaling:` in the e2e prints this ratio —
+re-measure it per model, because on a small enough model the old fan-out logic would win again.
+
+### The pool grows, it is not sized
+
+`engineCount` is a **cap, not a size**. `load()` brings up exactly one engine; the pool adds another only
+when a task that owns no engine is waiting. An engine no second task ever needed is ~1.6 GB on the 0.8B and
+~2.4 GB on the 2B, bought for nothing.
+
+**There is no budget to check first.** Firefox implements neither `navigator.deviceMemory` nor
+`performance.memory`, and `navigator.storage.estimate()` reports disk quota, not RAM — verified against the
+shipped binary, and re-checked every run by the `memory signals:` line in the e2e. Nothing tells an extension
+how much memory is left. So the pool does not predict, it probes: **a failed load is the memory check.**
+Growth then stops for that model and is not retried, and `status().growthBlocked` says so.
+
+**Growth is not instant.** Building an engine is a full model load — measured **51 s** for the 2B — so both
+tasks that triggered it will have finished first. The pool pays that once, in the background, and the second
+engine is there for the *next* collision. If a workload is known to be concurrent from the start, the honest
+fix is a warm-up request pair right after load, not a lower growth threshold.
+
+### Why each engine is a Web Worker
+
+Several MLCEngines cannot share a realm. Running the same e2e three ways isolates it:
 
 | setup | result |
 | --- | --- |
@@ -469,105 +597,136 @@ cannot share a realm. Running the same e2e three ways isolates it:
 | 2 engines, background page | both load, the first generates fine, the second's first generation fails: `Expected null or instance of VectorInt, got an instance of VectorInt` |
 | 2 engines, one worker each | passes |
 
-So the trigger is a second engine *generating* in the same realm — not the pool, and not the engine count by
+The trigger is a second engine *generating* in the same realm — not the pool, and not the engine count by
 itself. That message is embind reporting a type-registry mismatch, and the bundle does carry module-scoped
 emscripten state (`var Module`, `var __wasmLib`) shared by every instance, which fits; but the fix rests on
 the isolation above rather than on having traced the registry.
 
 Workers are viable because Firefox exposes WebGPU to dedicated workers and the 100 ms completion tick is
-shared across them, so the concurrency win survives the move off the main thread (measured: 4 workers,
-36.3 syncs/s).
+shared across them, so concurrency survives the move off the main thread (measured: 4 workers, 36.3 syncs/s).
 
-Measured on an M4 Air (16 GB) with `Qwen3.5-0.8B-q4f16_1-MLC`, four independent prompts:
+### How many engines are worth it
 
-| pool | peak overlap | aggregate vs. serial | verdict |
-| --- | --- | --- | --- |
-| 1 | 1 | 1.00x | serial, as designed |
-| **2** | 2 | **1.3x - 2.0x** | the default |
-| 4 | 4 | **0.3x** | 3x slower than one engine |
+Measured on the 0.8B, four independent prompts, back when fan-out still scaled:
 
-The two-engine figure is a range because the benchmark's output lengths vary run to run and four items on
-two engines leaves a ragged tail; the overlap itself is consistent. Four engines overlap in wall-clock terms
-but each drops from ~9.6 to ~0.7 tok/s.
+| pool | peak overlap | aggregate vs. serial |
+| --- | --- | --- |
+| 1 | 1 | 1.00x |
+| 2 | 2 | 1.3x - 2.0x |
+| 4 | 4 | **0.3x** — 3x slower than one engine |
 
-**Memory is why.** Loading engines one at a time and watching free memory step down gives a clean per-engine
-cost of **~1.6 GB**, matching the model's own `vram_required_MB` of 1629 — there is no hidden amplification
-per engine. But four of them plus their KV caches leave a 16 GB machine with almost nothing free, and they
-starve each other. `load()` therefore builds at most two engines at a time: loads overlap well (most of the
-time is shader compilation), but each also stages the full weight set in host memory first, and four
-simultaneous staging buffers on top of 6.5 GB resident is what tips the machine into swapping.
-
-So: **more engines is not more throughput.** Re-measure with `ENGINE_COUNT=n npm run e2e` before raising it,
-especially on a larger model where 1.6 GB becomes 4 GB.
+Four engines overlap in wall-clock terms but each drops from ~9.6 to ~0.7 tok/s: four copies of the weights
+plus their KV caches leave a 16 GB machine with nothing free, and they starve each other. **More engines is
+not more throughput** — and on the 2B, per the table above, a second one is not more throughput either. The
+route to concurrent throughput is batched decode inside one engine (see Current Tasks), not more engines.
 
 ## API for other extensions
 
-Extension id: `everything-webgpu@local`. The manager page prints a copy-pasteable version of this.
+Extension id: `everything-webgpu@local`. The manager page prints a copy-pasteable version.
+
+Two transports, one vocabulary ([src/lib/protocol.js](src/lib/protocol.js)):
+
+- `browser.runtime.sendMessage(id, req)` — request/response. Ops: `status`, `listModels`, `load`,
+  `unload`, `chat`, `batch`, `cancel`, `configure`.
+- `browser.runtime.connect(id, { name: "everything-webgpu/v1" })` — streaming. Ops: `subscribe`,
+  `chat.stream`, `batch.stream`, `abort`; the port also pushes `engineState` on every lifecycle change.
+
+Every message carries `protocol`, so a stray message from another sender fails fast instead of being
+half-interpreted. Generation ops accept `modelId`, `temperature`, `max_tokens`, `response_format`,
+`extra_body`, plus the scheduling fields `task`, `session`, `priority` and `preemptible`.
+
+**Send raw requests. Do not ask for a `translate` op.** The engine schedules a shared GPU; it does not
+author prompts. Prompts belong to whoever owns the feature, because they are model-specific — switching this
+build from `Qwen3.5-0.8B` to `Qwen3.8-2B-Distill` changed the conversation template and made every reply open
+with a `<think>` block. A prompt that lives in the caller survives that; a `translate` op baked into the
+engine would have to be rewritten and re-shipped to every caller. Wrap the transport in a client-side helper
+if you want `translate()` ergonomics — just keep it on your side of `sendMessage`.
+
+### The three shapes of work
+
+What differs between these is *not* the op. It is who owns an engine, and what may interrupt what.
+
+| | op | priority | key fields | why |
+| --- | --- | --- | --- | --- |
+| **Completion** (ghost text) | `chat.stream` | `interactive` | `session` | Each keystroke supersedes the last request; may preempt opted-in work. |
+| **Translation** (a page) | `batch` | `normal` | one shared `task` | One request instead of N, so the engine schedules it as a unit and it never hogs the pool. |
+| **Reformat** (markdown) | `chat` | `background` | `preemptible: true` | Nobody is watching; let interactive work cut in. |
+
+#### Completion — latency is the whole product
 
 ```js
-// One-shot completion
-const res = await browser.runtime.sendMessage("everything-webgpu@local", {
-  protocol: "everything-webgpu/v1",
-  op: "chat",
-  messages: [{ role: "user", content: "Translate to French: good morning" }],
-});
-if (!res.ok) throw new Error(res.error);
-console.log(res.text);
-
-// Streaming
 const port = browser.runtime.connect("everything-webgpu@local", { name: "everything-webgpu/v1" });
 port.onMessage.addListener((m) => {
-  if (m.op === "chunk") process(m.delta);
-  if (m.op === "done") finish(m.text, m.usage);
-  if (m.op === "error") fail(m.error);
+  if (m.op === "chunk") render(m.delta);
+  if (m.op === "done") finish(m.text);
 });
+
+// On every keystroke. The previous request is cancelled, not queued behind.
 port.postMessage({
   protocol: "everything-webgpu/v1",
   op: "chat.stream",
   id: crypto.randomUUID(),
-  messages: [{ role: "user", content: "Explain WebGPU in one line." }],
+  session: "ghost-text",     // supersession key — the important field
+  priority: "interactive",   // may preempt jobs that opted in
+  max_tokens: 24,            // ghost text is short; do not pay for more
+  messages: [{ role: "user", content: prefix }],
 });
 ```
 
-`sendMessage` ops: `status`, `listModels`, `load`, `unload`, `chat`, `batch`, `cancel`, `configure`.
-Port ops: `subscribe`, `chat.stream`, `batch.stream`, `abort`; the port also pushes `engineState` on every
-lifecycle change.
+`session` is what makes this work, not `cancel`. Reusing one session key means the engine drops the stale
+request itself; a caller that mints a fresh id per keystroke and calls `cancel` races its own typing.
 
-Generation ops accept `modelId`, `temperature`, `max_tokens`, `response_format`, `extra_body`, plus the
-scheduling fields `priority`, `session`, and `preemptible`.
-
-`configure` retunes a running engine without reloading its weights. It takes `decodeSteps` (1-32, see
-"Multi-step decoding"), applies it to every engine in the pool on the next burst, and persists it as the
-default.
-
-**Send independent work as one `batch`, not a loop of `chat` calls** — a loop serializes and gets you the
-~10 tok/s single-stream ceiling, while a batch fans across the pool. Each item may override the shared
-fields:
+#### Translation — throughput, one task
 
 ```js
-// Ghost-text: every keystroke supersedes the last request, no queue buildup.
-port.postMessage({
-  protocol: "everything-webgpu/v1",
-  op: "chat.stream",
-  id: crypto.randomUUID(),
-  session: "ghost-text",          // cancels the previous ghost-text request
-  priority: "interactive",         // may preempt jobs that opted in
-  max_tokens: 24,
-  messages: [{ role: "user", content: prefix }],
-});
-
-// Translating a page: independent sentences, fanned across the pool.
+// One batch, not a loop of `chat` calls.
 const res = await browser.runtime.sendMessage("everything-webgpu@local", {
   protocol: "everything-webgpu/v1",
   op: "batch",
-  requests: sentences.map((s) => ({ messages: [{ role: "user", content: `Translate to French: ${s}` }] })),
+  task: "translate-page",   // optional; a batch is one task either way
+  requests: sentences.map((s) => ({
+    messages: [{ role: "user", content: `Translate to French, output only the translation:\n${s}` }],
+  })),
 });
-
-// Background reformatting: long output nobody is watching.
-{ op: "chat", priority: "background", preemptible: true, messages: [...] }
+res.results.forEach((r) => apply(r.index, r.text));
 ```
 
-Results carry `engineIndex`, `startedAt` and `finishedAt` so a caller can verify work actually overlapped.
+Every item of one batch shares a task, and a task holds one engine, so a 200-sentence page occupies exactly
+one engine and can never freeze ghost-text behind it. Results carry `engineIndex`, `startedAt` and
+`finishedAt`, so a caller can check what actually ran where.
+
+`batch` is still the right call rather than a loop of `chat`: it is one round trip, the engine keeps the
+items in one queue it can reason about, and if this ever runs on a model small enough for fan-out to pay
+again — or once batched decode lands — the same call gets faster with no change on your side.
+
+Use `batch.stream` over a port instead if you want items as they land rather than one array at the end.
+
+#### Reformat — cheap to interrupt
+
+```js
+await browser.runtime.sendMessage("everything-webgpu@local", {
+  protocol: "everything-webgpu/v1",
+  op: "chat",
+  priority: "background",
+  preemptible: true,        // the direction matters — see below
+  max_tokens: 2048,
+  messages: [{ role: "user", content: `Reformat as clean Markdown, no commentary:\n\n${doc}` }],
+});
+```
+
+**Set `preemptible` on the work that can afford to lose, not on the work you care about.** Only an
+`interactive` request preempts, and only a job that opted in can be preempted. A preempted job resolves with
+`preempted: true` and whatever text it had, so it is never requeued and can never starve — but that also
+means you must be able to use, or discard, a partial result.
+
+### Getting these wrong
+
+| symptom | cause |
+| --- | --- |
+| Ghost text lags behind typing | Fresh `id` per keystroke with no `session`, so every stale request still runs. |
+| Page translation is slower than expected | Expected: one task is one engine, and a second engine measured 1.06x anyway. Throughput here comes from batched decode, not from more engines. |
+| Reformatting blocks completions | `preemptible` left off the background job, so `interactive` has nothing to take. |
+| Pool stays at one engine | Expected: it grows only when a *second task* waits. Check `status().growthBlocked` if two are waiting and it still has not. |
 
 By default every installed extension may call the API. The manager page has an allowlist field; fill it in
 with extension ids to restrict access.
@@ -587,9 +746,11 @@ with extension ids to restrict access.
 | [src/popup/](src/popup/) | Minimal test chat |
 | [src/manager/](src/manager/) | Drop target, registry, settings, setup help |
 | [test/integration.test.mjs](test/integration.test.mjs) | The cache-injection contract |
-| [test/scheduler.test.mjs](test/scheduler.test.mjs) | Priority, supersession and preemption, GPU-free |
+| [test/scheduler.test.mjs](test/scheduler.test.mjs) | Priority, supersession, preemption and pool growth, GPU-free |
 | [test/e2e/](test/e2e/) | Real-hardware end-to-end run (`npm run e2e`) |
 | [test/e2e/bench.mjs](test/e2e/bench.mjs) | Standalone WebGPU sync-latency benchmark (`npm run bench`) |
+| [MLC-COMPILE.md](MLC-COMPILE.md) | How the model was compiled, and every toolchain breakage on the way |
+| [tools/](tools/) | Model-compilation toolchain: setup, nightly patches, weight strip, wasm audits |
 
 The engine lives in the MV2 persistent background page — a real document on the extension origin, so it has
 both `navigator.gpu` and the same Cache Storage the manager page writes to. The model stays resident in VRAM
@@ -601,10 +762,14 @@ across popup opens and across calls from other extensions.
   install and self-distribution; it would need splitting before an AMO listing.
 - **MV2**: MV3 event pages get evicted, which would unload a multi-GB model between calls. Migrating needs a
   keep-alive or a dedicated engine tab.
-- **Thinking models burn the budget**: `Qwen3.5` spends output tokens inside `<think>` before answering, and
-  at ~10 tok/s that is seconds of nothing. Suppress it in your prompt for translation and completion — the
-  engine deliberately does not rewrite prompts for you.
-- **Decode speed**: bounded by Firefox's 100 ms WebGPU poll timer (Mozilla bug 1870699), not by the GPU.
-  Multi-step decoding buys back most of it — one sync per K tokens instead of per token — but the payoff is
-  quantized to whole 100 ms ticks, so K has to be tuned per model rather than raised. Stock, unbatched
-  single-step decode is ~10 tok/s. See "The 10 tok/s ceiling" and "Multi-step decoding".
+- **Thinking burns the budget**: this model opens every reply with a `<think>` block — it is a reasoning
+  distill and its card says so. At ~17 tok/s that is seconds of nothing before the answer starts. For
+  translation and completion, suppress it in your prompt, or rebuild the config with the `qwen3_5_nothink`
+  conversation template. The engine deliberately does not rewrite prompts for you.
+- **No cross-turn KV reuse**: every turn re-prefills the whole history at 5.27 ms/token, so a long
+  conversation pays ~22 s before its first token at the 4096 limit. See Current Tasks.
+- **Decode speed**: *was* bounded by Firefox's 100 ms WebGPU poll timer (Mozilla bug 1870699). Multi-step
+  decoding and compute-pass batching bought most of that back; what remains is memory bandwidth — decode
+  achieves ~16 GB/s of the M4's ~120. See "The 10 tok/s ceiling" and "Why not llama.cpp/Ollama-class".
+- **A second engine is not more speed**: measured 1.06x on this model. It buys isolation between tasks.
+  Concurrent throughput needs batched decode inside one engine. See "Scheduling".
