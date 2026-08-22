@@ -1,25 +1,50 @@
-body { width: 420px; height: 560px; display: flex; flex-direction: column; }
+body { width: 420px; height: 580px; display: flex; flex-direction: column; }
 
-header, footer { padding: 10px; display: flex; flex-direction: column; gap: 8px; }
+header, footer { padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; }
 header { border-bottom: 1px solid var(--line); }
-footer { border-top: 1px solid var(--line); }
+footer { border-top: 1px solid var(--line); gap: 8px; }
 
 main {
   flex: 1;
   overflow-y: auto;
-  padding: 10px;
+  padding: 16px 14px;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 18px;
 }
 
-.msg { padding: 7px 10px; border-radius: 9px; max-width: 90%; white-space: pre-wrap; word-break: break-word; }
-.msg.user { align-self: flex-end; background: var(--accent); color: var(--accent-ink); }
-.msg.assistant { align-self: flex-start; background: var(--panel); border: 1px solid var(--line); }
-.msg.error { align-self: stretch; background: transparent; border: 1px solid var(--danger); color: var(--danger); }
-.msg .meta { display: block; margin-top: 4px; font-size: 10px; opacity: .6; }
+/* Claude does not put the assistant in a bubble: the reply is just text on the
+   page, and only the user's turn gets a surface. Keeping that asymmetry is most
+   of what makes a transcript read as Claude's rather than as a chat app's. */
+.msg { white-space: pre-wrap; word-break: break-word; }
+.msg.user {
+  align-self: flex-end;
+  max-width: 85%;
+  background: var(--panel-strong);
+  border-radius: 12px;
+  padding: 9px 13px;
+}
+.msg.assistant { align-self: stretch; }
+.msg.error {
+  align-self: stretch;
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  padding: 9px 13px;
+}
+.msg .meta { display: block; margin-top: 6px; font-size: 11px; color: var(--muted); }
 
 .empty { margin: auto; text-align: center; color: var(--muted); max-width: 260px; }
 
-#input { resize: none; width: 100%; }
-#status { min-height: 16px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#input {
+  resize: none;
+  width: 100%;
+  background: var(--panel);
+  border-radius: 12px;
+  padding: 10px 12px;
+}
+#input:focus { border-color: var(--line-strong); }
+
+#status { min-height: 16px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+/* The load report is a sentence, not a label: let it wrap while it is showing,
+   otherwise it is silently truncated to "Loading model from cache[26/5…". */
+#status.loading { white-space: normal; overflow: visible; text-overflow: clip; }

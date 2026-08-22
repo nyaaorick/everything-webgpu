@@ -1,5 +1,5 @@
 /** Manager page: model ingestion, registry maintenance, engine settings, setup help. */
-import { ENGINE_STATE, OP, PORT_NAME, PORT_OP, PROTOCOL, request } from "../lib/protocol.js";
+import { ENGINE_STATE, OP, PORT_NAME, PORT_OP, PRIORITY, PROTOCOL, request } from "../lib/protocol.js";
 import {
   formatBytes,
   getSettings,
@@ -23,14 +23,41 @@ let lastEngineState = {};
 function renderEngine(state) {
   lastEngineState = state;
   $("dot").className = `dot ${state.status}`;
+  // `size` is engines that exist, which trails `maxSize` until a second task
+  // asks for one — so say both, or a pool of 1 under a cap of 2 reads as a bug.
   const pool = state.pool?.size
-    ? `  ·  pool ${state.pool.busy}/${state.pool.size} busy, ${state.pool.queued} queued`
+    ? `  ·  pool ${state.pool.busy}/${state.pool.size} busy, ${state.pool.queued} queued` +
+      (state.pool.growthBlocked
+        ? `  ·  stayed at ${state.pool.size} (${state.pool.growthBlocked})`
+        : state.pool.size < state.pool.maxSize
+          ? `  ·  up to ${state.pool.maxSize} on demand`
+          : "")
     : "";
+  const loading = state.status === ENGINE_STATE.LOADING;
+  // Show WebLLM's own report verbatim while loading — shard counts, MB and
+  // elapsed seconds are the only feedback there is during a ~48 s load, and a
+  // bare percentage hides all of it.
   $("engineStatus").textContent =
     state.error ? state.error :
     state.status === ENGINE_STATE.READY ? `loaded: ${state.modelId}${pool}` :
-    state.status === ENGINE_STATE.LOADING ? `loading ${state.modelId}… ${Math.round((state.progress?.progress ?? 0) * 100)}%` :
+    loading ? state.progress?.text ?? `loading ${state.modelId}…` :
     "idle";
+
+  $("engineBar").hidden = !loading;
+  $("engineProgress").style.width = `${Math.round((state.progress?.progress ?? 0) * 100)}%`;
+  const hint = $("engineHint");
+  if (!loading) {
+    hint.hidden = true;
+  } else {
+    const secs = state.progress?.timeElapsed;
+    // Not WebLLM's stock "first visit populates the cache" line: these weights
+    // were injected by drag-and-drop, so nothing is ever downloaded.
+    hint.textContent =
+      `${secs ? `${secs}s elapsed · ` : ""}reading from local cache, no network` +
+      ((state.progress?.progress ?? 0) > 0.99 ? " · compiling WebGPU shaders" : "") +
+      ".";
+    hint.hidden = false;
+  }
 }
 
 // ------------------------------------------------------------ diagnostics ---
@@ -223,35 +250,93 @@ $("save").addEventListener("click", async () => {
   renderEngine({ ...lastEngineState, note: "reload the model for the pool size to take effect" });
 });
 
-// --------------------------------------------------------------- API sample ---
+// ------------------------------------------------------------- Engine API ---
 
-function renderApiSample() {
-  const id = browser.runtime.id;
-  $("selfId").textContent = id;
-  $("apiSample").textContent = `// One-shot completion
-const res = await browser.runtime.sendMessage("${id}", {
-  protocol: "${PROTOCOL}",
-  op: "${OP.CHAT}",
-  messages: [{ role: "user", content: "Translate to French: good morning" }],
-});
-if (!res.ok) throw new Error(res.error);
-console.log(res.text);
-
-// Streaming
-const port = browser.runtime.connect("${id}", { name: "${PORT_NAME}" });
+/**
+ * The three shapes of work, as copy-paste starting points.
+ *
+ * They differ only in scheduling metadata, not in op — that is the whole point,
+ * and the reason there is no `translate` op to call. Each carries the one field
+ * that makes it behave correctly, because those are what callers get wrong.
+ */
+function apiSamples(id) {
+  return {
+    completion: {
+      why: "Latency is the product. `session` is what makes this work — reuse one key and the engine drops the stale request itself, so a fast typist never queues a request per keystroke.",
+      code: `const port = browser.runtime.connect("${id}", { name: "${PORT_NAME}" });
 port.onMessage.addListener((m) => {
-  if (m.op === "${PORT_OP.CHUNK}") process(m.delta);
-  if (m.op === "${PORT_OP.DONE}") finish(m.text, m.usage);
-  if (m.op === "${PORT_OP.ERROR}") fail(m.error);
+  if (m.op === "${PORT_OP.CHUNK}") render(m.delta);
+  if (m.op === "${PORT_OP.DONE}") finish(m.text);
 });
+
+// On every keystroke. The previous request is superseded, not queued.
 port.postMessage({
   protocol: "${PROTOCOL}",
   op: "${PORT_OP.CHAT_STREAM}",
   id: crypto.randomUUID(),
-  messages: [{ role: "user", content: "Explain WebGPU in one line." }],
+  session: "ghost-text",      // supersession key — the field that matters
+  priority: "${PRIORITY.INTERACTIVE}",   // may preempt work that opted in
+  max_tokens: 24,
+  messages: [{ role: "user", content: prefix }],
+});`,
+    },
+    translation: {
+      why: "One `batch`, not a loop of `chat` calls: one round trip, and the engine schedules the whole page as a single task that can never occupy more than one engine.",
+      code: `const res = await browser.runtime.sendMessage("${id}", {
+  protocol: "${PROTOCOL}",
+  op: "${OP.BATCH}",
+  task: "translate-page",     // optional; a batch is one task either way
+  requests: sentences.map((s) => ({
+    messages: [{ role: "user", content: \`Translate to French, output only the translation:\\n\${s}\` }],
+  })),
 });
+if (!res.ok) throw new Error(res.error);
+res.results.forEach((r) => apply(r.index, r.text));`,
+    },
+    reformat: {
+      why: "Nobody is watching, so let interactive work cut in. Set `preemptible` on the job that can afford to lose — a preempted job resolves with `preempted: true` and its partial text, never requeued.",
+      code: `const res = await browser.runtime.sendMessage("${id}", {
+  protocol: "${PROTOCOL}",
+  op: "${OP.CHAT}",
+  priority: "${PRIORITY.BACKGROUND}",
+  preemptible: true,          // the direction matters
+  max_tokens: 2048,
+  messages: [{ role: "user", content: \`Reformat as clean Markdown, no commentary:\\n\\n\${doc}\` }],
+});
+if (res.preempted) keepOrDiscard(res.text);`,
+    },
+  };
+}
 
-// Also available via sendMessage: "${OP.STATUS}", "${OP.LIST_MODELS}", "${OP.LOAD}", "${OP.UNLOAD}"`;
+function renderApiSample() {
+  const id = browser.runtime.id;
+  const samples = apiSamples(id);
+  $("selfId").textContent = id;
+
+  const show = (name) => {
+    for (const tab of document.querySelectorAll(".tab")) {
+      tab.classList.toggle("active", tab.dataset.tab === name);
+    }
+    $("apiWhy").textContent = samples[name].why;
+    $("apiSample").textContent = samples[name].code;
+  };
+
+  for (const tab of document.querySelectorAll(".tab")) {
+    tab.addEventListener("click", () => show(tab.dataset.tab));
+  }
+  show("completion");
+
+  const flash = (btn, label) => {
+    const original = btn.textContent;
+    btn.textContent = label;
+    setTimeout(() => (btn.textContent = original), 1200);
+  };
+  $("copyId").addEventListener("click", () =>
+    navigator.clipboard.writeText(id).then(() => flash($("copyId"), "Copied")),
+  );
+  $("copyCode").addEventListener("click", () =>
+    navigator.clipboard.writeText($("apiSample").textContent).then(() => flash($("copyCode"), "Copied")),
+  );
 }
 
 renderGpu();

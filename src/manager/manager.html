@@ -13,9 +13,40 @@
     <span id="dot" class="dot"></span>
     <h1 class="grow">Everything WebGPU</h1>
     <span id="engineStatus" class="muted mono"></span>
+    <div class="bar" id="engineBar" hidden><i id="engineProgress"></i></div>
+    <div id="engineHint" class="muted hint" hidden></div>
   </header>
 
   <section id="gpu" class="banner" hidden></section>
+
+  <section id="api">
+    <h2>Engine API</h2>
+    <div class="idbar">
+      <code id="selfId" class="mono grow"></code>
+      <button id="copyId">Copy ID</button>
+    </div>
+    <p class="muted">
+      Any Firefox extension drives this engine by messaging that ID — <code>runtime.sendMessage</code> for
+      request/response, <code>runtime.connect</code> for streaming. Send raw requests: the engine schedules a
+      shared GPU, it does not author prompts, so prompts stay on your side and survive a model change.
+    </p>
+
+    <div class="tabs" role="tablist">
+      <button class="tab" data-tab="completion" role="tab">Completion</button>
+      <button class="tab" data-tab="translation" role="tab">Translation</button>
+      <button class="tab" data-tab="reformat" role="tab">Reformat</button>
+    </div>
+    <p id="apiWhy" class="muted hint"></p>
+    <div class="codewrap">
+      <button id="copyCode" class="copy">Copy</button>
+      <pre class="mono"><code id="apiSample"></code></pre>
+    </div>
+    <p class="muted hint">
+      One task holds one engine, so a whole <code>batch</code> occupies one and can never starve a completion.
+      A second engine is built only when a second task is waiting, and on this model it is worth ~1.06x — it
+      buys isolation, not speed. Full reference in <code>AI.md</code>.
+    </p>
+  </section>
 
   <section>
     <h2>Add a model</h2>
@@ -70,17 +101,6 @@
       <button id="save" class="primary">Save settings</button>
       <span id="saved" class="muted" hidden>Saved.</span>
     </div>
-  </section>
-
-  <section>
-    <h2>API for other extensions</h2>
-    <p class="muted">Any Firefox extension can drive this engine by messaging <code id="selfId" class="mono"></code>.</p>
-    <p class="muted">
-      One generation can never exceed ~10 tok/s (see the README). Concurrent ones each get their own ~10 tok/s,
-      so send independent work as a single <code>batch</code> rather than a loop of <code>chat</code> calls, and
-      tag latency-critical work <code>priority: "interactive"</code>.
-    </p>
-    <pre class="mono"><code id="apiSample"></code></pre>
   </section>
 
   <section>

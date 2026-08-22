@@ -1,12 +1,46 @@
-.wrap { max-width: 820px; margin: 0 auto; padding: 24px 20px 60px; display: flex; flex-direction: column; gap: 26px; }
+.wrap { max-width: 820px; margin: 0 auto; padding: 28px 24px 72px; display: flex; flex-direction: column; gap: 30px; }
 
-header { padding-bottom: 12px; border-bottom: 1px solid var(--line); }
+header { padding-bottom: 14px; border-bottom: 1px solid var(--line); }
 section { display: flex; flex-direction: column; gap: 10px; }
 
+/* ------------------------------------------------------------ engine API --- */
+/* First section on the page: an integrator opening this page is here for the
+   ID and a snippet, not to re-read the model list. */
+#api { padding: 18px; border: 1px solid var(--line-strong); border-radius: 12px; background: var(--panel); }
+
+.idbar { display: flex; gap: 8px; align-items: center; }
+.idbar > code {
+  padding: 7px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg);
+  overflow-x: auto;
+  white-space: nowrap;
+}
+
+.tabs { display: flex; gap: 4px; margin-top: 4px; }
+.tab { border-color: transparent; color: var(--muted); padding: 5px 11px; border-radius: 99px; }
+.tab:hover:not(.active) { background: var(--panel-strong); }
+.tab.active { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 500; }
+
+.codewrap { position: relative; }
+.codewrap .copy {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  padding: 4px 10px;
+  font-size: 12px;
+  background: var(--bg);
+  opacity: 0;
+  transition: opacity .12s ease;
+}
+.codewrap:hover .copy, .codewrap .copy:focus-visible { opacity: 1; }
+
+/* ---------------------------------------------------------------- models --- */
 #drop {
-  border: 1.5px dashed var(--line);
+  border: 1.5px dashed var(--line-strong);
   border-radius: 12px;
-  padding: 26px 20px;
+  padding: 28px 20px;
   text-align: center;
   display: flex;
   flex-direction: column;
@@ -14,26 +48,36 @@ section { display: flex; flex-direction: column; gap: 10px; }
   align-items: center;
   transition: border-color .15s, background .15s;
 }
-#drop.over { border-color: var(--accent); background: rgba(124, 156, 255, .08); }
+#drop.over { border-color: var(--accent); background: var(--panel-strong); }
 #drop p { margin: 0; max-width: 560px; }
 
 table { width: 100%; border-collapse: collapse; }
-th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--line); vertical-align: middle; }
 th { color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
-td.mono { font-family: "SF Mono", ui-monospace, Menlo, monospace; font-size: 11px; }
-table.flags td { border: none; padding: 3px 10px 3px 0; }
+td.mono { font-size: 12px; }
+table.flags td { border: none; padding: 3px 12px 3px 0; }
 
-.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; }
-label { display: flex; flex-direction: column; gap: 4px; color: var(--muted); font-size: 12px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
+label { display: flex; flex-direction: column; gap: 5px; color: var(--muted); font-size: 12px; }
 label.block { width: 100%; }
-label input, label textarea { color: var(--text); }
+label input, label textarea { color: var(--ink); background: var(--panel); }
 textarea { resize: vertical; }
 
-pre { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; overflow-x: auto; margin: 0; }
-code { font-family: "SF Mono", ui-monospace, Menlo, monospace; }
+pre {
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 14px;
+  overflow-x: auto;
+  margin: 0;
+  line-height: 1.55;
+}
+code { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
 
-.pill { padding: 2px 7px; border-radius: 99px; font-size: 10px; border: 1px solid var(--line); }
-.pill.ok { color: var(--ok); border-color: var(--ok); }
-.pill.bad { color: var(--danger); border-color: var(--danger); }
+.pill { padding: 2px 8px; border-radius: 99px; font-size: 10px; border: 1px solid var(--line-strong); color: var(--muted); }
+.pill.ok { color: var(--accent); border-color: var(--accent); }
+.pill.bad { color: var(--ink); border-color: var(--ink); }
 
-.warn { color: #ffb454; }
+/* There is no fourth colour to warn in, so a warning is stated in the accent
+   and carried by the sentence rather than by hue alone. */
+.warn { color: var(--accent); }

@@ -4,19 +4,51 @@ import { ENGINE_STATE, OP, PORT_NAME, PORT_OP, PRIORITY, PROTOCOL, request } fro
 const $ = (id) => document.getElementById(id);
 const els = {
   dot: $("dot"), model: $("model"), load: $("load"), unload: $("unload"),
-  progress: $("progress"), status: $("status"), log: $("log"), input: $("input"),
+  progress: $("progress"), status: $("status"), loadHint: $("loadHint"), log: $("log"), input: $("input"),
   send: $("send"), stop: $("stop"), clear: $("clear"), manage: $("manage"),
 };
 
 const history = [];
+let models = [];
 let engineState = { status: ENGINE_STATE.IDLE, modelId: null, pool: null };
 let streamId = null;
 let streamEl = null;
+
+/**
+ * The engine supersedes by `session`, so a cleared conversation has to become a
+ * *different* session — otherwise the next message looks to the scheduler like
+ * a continuation of the one just thrown away.
+ */
+const newSession = () => `popup-${crypto.randomUUID()}`;
+let session = newSession();
 
 const port = browser.runtime.connect({ name: PORT_NAME });
 port.onMessage.addListener(onPortMessage);
 
 // -------------------------------------------------------------- rendering ---
+
+/**
+ * The second line of the load guide.
+ *
+ * Deliberately not WebLLM's stock wording. Its default hint is about populating
+ * a cache from the network on first visit, which is never what happens here:
+ * the weights were injected into Cache Storage by drag-and-drop, so nothing is
+ * downloaded and a "later refreshes are faster" promise would be wrong. What
+ * the user is actually waiting on, once the shards are read, is WebGPU shader
+ * compilation.
+ */
+function renderLoadHint(progress) {
+  if (!progress) return void (els.loadHint.hidden = true);
+  const secs = progress.timeElapsed;
+  const parts = [];
+  if (progress.engines > 1) parts.push(`${progress.engines} engines, loaded 2 at a time`);
+  parts.push("weights come from the local cache — nothing is downloaded");
+  if ((progress.progress ?? 0) > 0.99) {
+    parts.push("compiling WebGPU shaders, which is most of the wait");
+  }
+  els.loadHint.textContent = `${secs ? `${secs}s elapsed · ` : ""}${parts.join(" · ")}.`;
+  els.loadHint.hidden = false;
+}
 
 function renderState() {
   const { status, modelId, progress, error, pool } = engineState;
@@ -30,12 +62,18 @@ function renderState() {
     status === ENGINE_STATE.LOADING ? `Loading ${modelId}…` :
     "Idle — pick a model and press Load";
   if (!error && status === ENGINE_STATE.READY && pool && (pool.busy || pool.queued)) {
-    els.status.textContent += ` · ${pool.busy}/${pool.size} busy, ${pool.queued} queued`;
+    const cap = pool.size < pool.maxSize && !pool.growthBlocked ? `/${pool.maxSize}` : "";
+    els.status.textContent += ` · ${pool.busy}/${pool.size}${cap} busy, ${pool.queued} queued`;
   }
   els.status.classList.toggle("banner", Boolean(error));
   els.status.classList.toggle("error", Boolean(error));
 
   const loading = status === ENGINE_STATE.LOADING;
+  // The report is a full sentence from WebLLM ("Loading model from cache[26/58]:
+  // 890MB loaded. 51% completed, 121 secs elapsed."). #status is a single
+  // ellipsised line by default, which cut it off, so unclip it while loading.
+  els.status.classList.toggle("loading", loading && Boolean(progress?.text));
+  renderLoadHint(loading ? progress : null);
   els.load.disabled = loading || !els.model.value;
   els.unload.disabled = loading || status !== ENGINE_STATE.READY;
   els.model.disabled = loading;
@@ -44,7 +82,7 @@ function renderState() {
   els.load.textContent = status === ENGINE_STATE.READY && modelId === els.model.value ? "Reload" : "Load";
 }
 
-function renderEmpty(models) {
+function renderEmpty() {
   els.log.replaceChildren(
     Object.assign(document.createElement("div"), {
       className: "empty",
@@ -74,13 +112,14 @@ async function ask(op, payload) {
 }
 
 async function refreshModels() {
-  const { models, state } = await ask(OP.LIST_MODELS);
-  engineState = state;
+  const res = await ask(OP.LIST_MODELS);
+  models = res.models;
+  engineState = res.state;
   els.model.replaceChildren(
     ...models.map((m) => new Option(`${m.model_id}  ·  ${(m.sizeBytes / 1e9).toFixed(1)} GB`, m.model_id)),
   );
-  if (state.modelId) els.model.value = state.modelId;
-  if (!els.log.children.length || els.log.querySelector(".empty")) renderEmpty(models);
+  if (res.state.modelId) els.model.value = res.state.modelId;
+  if (!els.log.children.length || els.log.querySelector(".empty")) renderEmpty();
   renderState();
 }
 
@@ -102,7 +141,7 @@ function send() {
     modelId: els.model.value || undefined,
     messages: history,
     priority: PRIORITY.INTERACTIVE,
-    session: "popup",
+    session,
   });
 }
 
@@ -155,11 +194,28 @@ els.load.addEventListener("click", () =>
 els.unload.addEventListener("click", () => ask(OP.UNLOAD).catch(() => {}));
 els.send.addEventListener("click", send);
 els.stop.addEventListener("click", () =>
-  port.postMessage({ protocol: PROTOCOL, op: PORT_OP.ABORT, id: streamId, session: "popup" }),
+  port.postMessage({ protocol: PROTOCOL, op: PORT_OP.ABORT, id: streamId, session }),
 );
+
+/**
+ * Discard the conversation and start a fresh session.
+ *
+ * All three parts matter. Dropping `history` alone left every rendered message
+ * on screen, which read as the button doing nothing; and leaving the old
+ * session key in place meant a request that was still streaming kept writing
+ * into a conversation the user had already thrown away.
+ */
 els.clear.addEventListener("click", () => {
+  if (streamId) {
+    port.postMessage({ protocol: PROTOCOL, op: PORT_OP.ABORT, id: streamId, session });
+    streamId = null;
+    streamEl = null;
+  }
   history.length = 0;
-  refreshModels();
+  session = newSession();
+  renderEmpty();
+  els.input.value = "";
+  renderState();
 });
 els.manage.addEventListener("click", () => {
   browser.runtime.openOptionsPage();
