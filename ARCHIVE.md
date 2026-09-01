@@ -169,3 +169,35 @@ Kept because each was stated confidently and was wrong; a future reader should n
   (~51 s each). Additive residency does not exist upstream.
 - **"No load time is measured in the repo."** It is: 51 s, [AI.md](AI.md) line 77. A grep for the
   wrong phrasing missed the table row.
+
+
+## `npm run e2e` verified the extraction on real hardware
+
+First run against the post-extraction tree: real Firefox, real GPU (Apple Silicon, `shader-f16`),
+real `Qwen3.5-0.8B-q4f16_1-MLC`, drag-and-drop ingestion through the production `src/engine/` and
+`src/adapters/webext.js` paths. **`e2e PASS`.**
+
+- Ingest: 443,129,354 bytes, 11 shards, 2531 ms. Load: 48.1 s (AI.md's 51 s figure is for the larger
+  2B; the 0.8B here loading faster is consistent with that being memory-bandwidth-bound).
+- Decode: 27.4 tok/s over 127 tokens — inside AI.md's measured 16.6–27.9 tok/s range for this model.
+  Decode probe: 664 kernels/token (639 forward + 25 sampling), 16.1 flushes/token — the same shape
+  the compute-pass-batching patch targets, and it is still applying (41.3 kernels/flush).
+- KV-reuse path exercised and correct: paged prefill and forced ragged re-prefill produced identical
+  output on a multi-round conversation. Re-prefill slope 2.29 ms/token, in the neighbourhood of
+  AI.md's 5.27 ms/token figure (different model, different history length — not a direct comparison).
+- The scheduler's own two-tasks-two-engines check: 3.8 s concurrent vs 4.0 s sequential = **1.05x**,
+  consistent with AI.md's measured 1.06x. This is the number the "second engine buys isolation, not
+  throughput" framing rests on, now reconfirmed after the pool moved to `#pools: Map<modelId,
+  EnginePool>` — evidence the multi-model split did not regress the single-model scheduling behaviour
+  it was built on top of.
+
+**One number worth a second look, not treated as a finding here:** this run reported
+`storageBuffersPerStage=9`. It did not block anything — the KV-reuse path was exercised in the same
+run and passed — but it is the exact threshold `probeDevice()`'s `NO_KV_REUSE` warning keys off, so a
+future run reporting the same value is worth cross-checking against `device.test.mjs`'s assumptions
+rather than assumed benign a second time.
+
+The manifest.json restore left a diff — `restore()` round-trips the file through
+`JSON.parse`/`stringify`, which turns `\uXXXX`-escaped em-dashes back into literal UTF-8. Cosmetic,
+not a behaviour change, reverted with `git checkout`. Worth knowing before the next e2e run leaves the
+same diff and it looks like something broke.

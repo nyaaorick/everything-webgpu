@@ -26,6 +26,8 @@ cheaper once `demo` is consuming the package rather than the source tree.
       there. Entirely a prediction today; `probeDevice()` is the instrument that makes it reportable.
 - [ ] **`demo` consumes the package**, and the popup + manager leave `main`. This is the acceptance
       test for the whole extraction: if the extension rebuilds on the package, the boundary is right.
+      `npm run e2e` passing is a first proof at the source-tree level; this is the same claim at the
+      package level.
 - [ ] **Write `README.md`.** Still none, and AI.md refers to one in ~20 places. Move "The three
       shapes of work" and "Getting these wrong" across — they are already the best docs in the repo.
 
@@ -275,9 +277,14 @@ Model- and kernel-level work. Independent of the library structure.
 
 ## 6. Test and infrastructure
 
-- [ ] **`npm run e2e` has never been run against any of this work.** Every change since the
-      extraction is verified by unit tests and `--check-entries` only. This is the largest single
-      gap in confidence.
+- [x] **`npm run e2e` — run against the extraction, `e2e PASS`.** Real Firefox, real GPU, real
+      Qwen3.5-0.8B, drag-and-drop ingestion through the production `src/engine/` + `src/adapters/`
+      paths. Decode 27.4 tok/s (in AI.md's measured 16.6–27.9 range), KV-reuse pipeline byte-identical
+      to forced re-prefill, and the scheduler's own two-tasks-two-engines check landed at 1.05x —
+      consistent with AI.md's 1.06x, confirming the pool split did not regress task isolation.
+      One anomaly worth a closer look: `storageBuffersPerStage=9` on this run (AI.md's baseline
+      elsewhere reports it differently) — not a failure, since the KV-reuse path was exercised and
+      passed regardless, but the number moving is worth a second look before trusting it blindly.
 - [ ] Fix `PROFILE_PATH` in [test/e2e/run.mjs](test/e2e/run.mjs): it passes `--profile-path`, but
       web-ext 8 calls it `--firefox-profile` and exits with `Unknown arguments`.
 - [ ] Isolate the bench's pass-sweep onto its own device. 2048 compute passes in one encoder loses
