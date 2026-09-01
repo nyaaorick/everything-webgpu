@@ -5,13 +5,8 @@
  * Everything is validated before the first byte is written, so a folder that is
  * missing a shard fails immediately instead of after copying 2 GB.
  */
-import {
-  CACHE_CONFIG,
-  CACHE_MODEL,
-  CACHE_WASM,
-  baseUrlFor,
-  saveModel,
-} from "./model-store.js";
+import { ERROR, EngineError } from "./errors.js";
+import { CACHE_CONFIG, CACHE_MODEL, CACHE_WASM, SOURCE, baseUrlFor, toModelType } from "./model-store.js";
 
 /** WebLLM asks for this name; older MLC exports ship `ndarray-cache.json`. */
 const TENSOR_MANIFEST = "tensor-cache.json";
@@ -71,11 +66,23 @@ export function filesFromInput(fileList) {
 
 /**
  * @param {Array<{path: string, file: File}>} entries
- * @param {{ modelId?: string, onProgress?: (p: {phase: string, done: number, total: number, label: string}) => void }} opts
+ * @param {object} opts
+ * @param {import("./model-store.js").ModelStore} opts.store where the registry entry lands
+ * @param {string} [opts.modelId] overrides the id inferred from the folder name
+ * @param {"llm"|"embedding"|"vlm"} [opts.modelType] declare a vision model, or WebLLM
+ *   rejects every image sent to it
+ * @param {(p: {phase: string, done: number, total: number, label: string}) => void} [opts.onProgress]
  * @returns {Promise<object>} the saved registry record
  */
-export async function ingestModelFolder(entries, { modelId, onProgress = () => {} } = {}) {
-  if (!entries?.length) throw new Error("Nothing was dropped — expected a model folder.");
+export async function ingestModelFolder(entries, { store, modelId, modelType, onProgress = () => {} } = {}) {
+  if (!store) {
+    throw new EngineError(ERROR.BAD_REQUEST, "ingestModelFolder needs a `store` to save the registry entry into.");
+  }
+  if (!entries?.length) {
+    throw new EngineError(ERROR.INVALID_MODEL_FOLDER, "Nothing was dropped — expected a model folder.", {
+      reason: "empty",
+    });
+  }
 
   const byPath = new Map();
   const byName = new Map();
@@ -92,32 +99,48 @@ export async function ingestModelFolder(entries, { modelId, onProgress = () => {
 
   const configFile = find(CHAT_CONFIG);
   if (!configFile) {
-    throw new Error(
-      `Missing ${CHAT_CONFIG}. Drop the folder produced by \`mlc_llm convert_weights\` + \`gen_config\`, not a raw HuggingFace checkpoint.`,
+    throw new EngineError(
+      ERROR.INVALID_MODEL_FOLDER,
+      `Missing ${CHAT_CONFIG}. Use the folder produced by \`mlc_llm convert_weights\` + \`gen_config\`, not a raw HuggingFace checkpoint.`,
+      { reason: "missing-config", missing: [CHAT_CONFIG] },
     );
   }
   const chatConfig = await readJson(configFile, CHAT_CONFIG);
 
   const tensorFile = find(TENSOR_MANIFEST) ?? find(LEGACY_TENSOR_MANIFEST);
   if (!tensorFile) {
-    throw new Error(`Missing ${TENSOR_MANIFEST} (or legacy ${LEGACY_TENSOR_MANIFEST}) — the weight shard index.`);
+    throw new EngineError(
+      ERROR.INVALID_MODEL_FOLDER,
+      `Missing ${TENSOR_MANIFEST} (or legacy ${LEGACY_TENSOR_MANIFEST}) — the weight shard index.`,
+      { reason: "missing-manifest", missing: [TENSOR_MANIFEST] },
+    );
   }
   const isLegacyManifest = !find(TENSOR_MANIFEST);
   const tensorManifest = await readJson(tensorFile, tensorFile.name);
 
   const records = tensorManifest.records;
   if (!Array.isArray(records) || records.length === 0) {
-    throw new Error(`${tensorFile.name} has no "records" array — it is not an MLC weight index.`);
+    throw new EngineError(
+      ERROR.INVALID_MODEL_FOLDER,
+      `${tensorFile.name} has no "records" array — it is not an MLC weight index.`,
+      { reason: "malformed-manifest" },
+    );
   }
 
   const shardPaths = records.map((r) => r.dataPath).filter(Boolean);
   if (shardPaths.length !== records.length) {
-    throw new Error(`${tensorFile.name} has records without a "dataPath".`);
+    throw new EngineError(
+      ERROR.INVALID_MODEL_FOLDER,
+      `${tensorFile.name} has records without a "dataPath".`,
+      { reason: "malformed-manifest" },
+    );
   }
   const missingShards = shardPaths.filter((p) => !find(p));
   if (missingShards.length) {
-    throw new Error(
+    throw new EngineError(
+      ERROR.INVALID_MODEL_FOLDER,
       `${missingShards.length} weight shard(s) missing from the folder: ${missingShards.slice(0, 5).join(", ")}${missingShards.length > 5 ? ", …" : ""}`,
+      { reason: "missing-shards", missing: missingShards },
     );
   }
 
@@ -126,27 +149,39 @@ export async function ingestModelFolder(entries, { modelId, onProgress = () => {
     (name) => tokenizerNames.includes(name) && find(name),
   );
   if (!tokenizerName) {
-    throw new Error(
+    throw new EngineError(
+      ERROR.INVALID_MODEL_FOLDER,
       `No usable tokenizer. ${CHAT_CONFIG} lists [${tokenizerNames.join(", ") || "nothing"}], and neither tokenizer.json nor tokenizer.model is present in the folder.`,
+      { reason: "missing-tokenizer", expected: tokenizerNames },
     );
   }
 
   const wasmEntries = [...byPath.entries()].filter(([p]) => p.endsWith(".wasm"));
   if (wasmEntries.length === 0) {
-    throw new Error(
+    throw new EngineError(
+      ERROR.INVALID_MODEL_FOLDER,
       "No .wasm model library found. Add the matching `*-webgpu.wasm` from mlc-ai/binary-mlc-llm-libs to the folder.",
+      { reason: "missing-wasm" },
     );
   }
   if (wasmEntries.length > 1) {
-    throw new Error(
+    throw new EngineError(
+      ERROR.INVALID_MODEL_FOLDER,
       `Found ${wasmEntries.length} .wasm files (${wasmEntries.map(([p]) => p).join(", ")}); the folder must contain exactly one model library.`,
+      { reason: "ambiguous-wasm", found: wasmEntries.map(([p]) => p) },
     );
   }
   const [wasmPath, wasmFile] = wasmEntries[0];
   const wasmName = basename(wasmPath);
 
   const id = (modelId || inferModelId(entries) || wasmName.replace(/(-webgpu)?\.wasm$/, "")).trim();
-  if (!id) throw new Error("Could not determine a model id — name the folder after the model.");
+  if (!id) {
+    throw new EngineError(
+      ERROR.INVALID_MODEL_FOLDER,
+      "Could not determine a model id — name the folder after the model, or pass `modelId`.",
+      { reason: "no-model-id" },
+    );
+  }
 
   const base = baseUrlFor(id);
 
@@ -195,10 +230,12 @@ export async function ingestModelFolder(entries, { modelId, onProgress = () => {
   const keys = { [CACHE_CONFIG]: [], [CACHE_MODEL]: [], [CACHE_WASM]: [] };
   for (const item of plan) keys[item.scope].push(item.url);
 
-  return saveModel({
+  return store.save({
     model_id: id,
     model: base,
     model_lib: base + wasmName,
+    source: SOURCE.INJECTED,
+    ...(toModelType(modelType) !== undefined ? { model_type: toModelType(modelType) } : {}),
     ...(chatConfig.context_window_size > 0
       ? { overrides: { context_window_size: chatConfig.context_window_size } }
       : {}),
@@ -216,7 +253,10 @@ async function readJson(file, label) {
   try {
     return JSON.parse(await file.text());
   } catch (err) {
-    throw new Error(`${label} is not valid JSON: ${err.message}`);
+    throw new EngineError(ERROR.INVALID_MODEL_FOLDER, `${label} is not valid JSON: ${err.message}`, {
+      reason: "malformed-json",
+      file: label,
+    });
   }
 }
 

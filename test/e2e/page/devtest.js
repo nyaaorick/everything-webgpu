@@ -4,9 +4,12 @@
  * production code path, then drives the background engine host over the public
  * protocol and reports back over HTTP.
  */
-import { OP, PORT_NAME, PORT_OP, PRIORITY, PROTOCOL, request } from "../lib/protocol.js";
-import { ingestModelFolder } from "../lib/ingest.js";
-import { listModels, setSettings, verifyModelCache } from "../lib/model-store.js";
+import { OP, PORT_NAME, PORT_OP, PRIORITY, PROTOCOL, request } from "../adapters/protocol.js";
+import { ingestModelFolder } from "../engine/ingest.js";
+import { ModelStore } from "../engine/model-store.js";
+import { webExtensionStorage } from "../adapters/webext.js";
+
+const store = new ModelStore(webExtensionStorage());
 import { gpuBench } from "./gpubench.js";
 
 const SERVER = "http://127.0.0.1:8787";
@@ -38,7 +41,7 @@ async function ask(op, payload) {
 try {
   // 1. WebGPU must exist in the background page, which is where the engine runs.
   if (manifestEngineCount) {
-    await setSettings({ engineCount: manifestEngineCount });
+    await store.setSettings({ engineCount: manifestEngineCount });
     log(`pool size forced to ${manifestEngineCount}`);
   }
   const status = await ask(OP.STATUS);
@@ -91,14 +94,14 @@ try {
 
   // 3. Production ingestion path.
   const t0 = performance.now();
-  const record = await ingestModelFolder(entries);
+  const record = await ingestModelFolder(entries, { store });
   log(`ingested ${record.model_id} in ${Math.round(performance.now() - t0)}ms — ${record.shardCount} shards, ${record.fileCount} cache keys, lib ${record.wasm}`);
   log(`base url: ${record.model}`);
 
-  const verified = await verifyModelCache(record);
+  const verified = await store.verify(record);
   log(`cache verify: ok=${verified.ok} missing=${verified.missing.length}`);
   if (!verified.ok) throw new Error("cache incomplete right after ingestion");
-  log(`registry: ${(await listModels()).map((m) => m.model_id).join(", ")}`);
+  log(`registry: ${(await store.list()).map((m) => m.model_id).join(", ")}`);
 
   // 4. Load. Every artifact URL points at local-model.invalid, which cannot
   //    resolve — a successful load *is* the proof that nothing was downloaded.

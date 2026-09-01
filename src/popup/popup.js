@@ -1,5 +1,5 @@
 /** Minimal test chat. Thin client over the background engine host's port protocol. */
-import { ENGINE_STATE, OP, PORT_NAME, PORT_OP, PRIORITY, PROTOCOL, request } from "../lib/protocol.js";
+import { ENGINE_STATE, OP, PORT_NAME, PORT_OP, PRIORITY, PROTOCOL, request } from "../adapters/protocol.js";
 
 const $ = (id) => document.getElementById(id);
 const els = {

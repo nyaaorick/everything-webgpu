@@ -5,8 +5,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { EnginePool } from "../src/background/pool.js";
-import { PRIORITY } from "../src/lib/protocol.js";
+import { EnginePool } from "../src/engine/pool.js";
+import { PRIORITY } from "../src/engine/constants.js";
 
 /** Lets the test decide exactly when a generation is allowed to finish. */
 function fakeEngine() {

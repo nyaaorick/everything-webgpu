@@ -33,7 +33,7 @@
  *
  * `createEngine` is injected so the scheduler can be tested without a GPU.
  */
-import { PRIORITY, PRIORITY_ORDER } from "../lib/protocol.js";
+import { PRIORITY, PRIORITY_ORDER } from "./constants.js";
 
 let nextJobId = 0;
 
@@ -48,6 +48,11 @@ export class EnginePool {
   #growing = null;
   /** Set to the failure reason once a grow attempt fails; growth then stops. */
   #growthBlocked = null;
+  /**
+   * Bumped by `unload()`. An engine that finishes loading against a stale
+   * generation is torn down rather than installed — see `load()`.
+   */
+  #generation = 0;
 
   constructor({ size = 2, createEngine, onStateChange = () => {} }) {
     this.#maxSize = Math.max(1, Math.min(4, size));
@@ -81,10 +86,19 @@ export class EnginePool {
   async load(onProgress = () => {}) {
     if (this.#loading) return this.#loading;
 
+    const generation = this.#generation;
     this.#loading = (async () => {
       const engine = await this.#createEngine(0, (report) =>
         onProgress({ ...report, engine: 1, engines: 1 }),
       );
+      // `unload()` may have run while this was still building — a cancelled
+      // load, or a model switch. Installing it now would resurrect an engine
+      // nobody holds a reference to, leaking its worker and a full copy of the
+      // weights. `#grow()` has always guarded this; `load()` did not.
+      if (generation !== this.#generation) {
+        await engine.unload?.().catch(() => {});
+        return 0;
+      }
       this.#slots = [{ engine, job: null }];
       return this.#slots.length;
     })().finally(() => {
@@ -95,6 +109,7 @@ export class EnginePool {
   }
 
   async unload() {
+    this.#generation += 1;
     for (const job of this.#allJobs()) this.#finish(job, { cancelled: true });
     for (const p of this.#queues.values()) p.length = 0;
     this.#bySession.clear();
@@ -112,7 +127,7 @@ export class EnginePool {
    * @param {string} [spec.session] later jobs with this session supersede earlier ones
    * @param {string} [spec.priority] one of PRIORITY
    * @param {boolean} [spec.preemptible] may be interrupted by an interactive job
-   * @param {(delta: string) => void} [spec.onChunk]
+   * @param {(chunk: object) => void} [spec.onChunk] WebLLM's chunk, verbatim
    * @returns {Promise<{text: string, usage?: object, cancelled?: boolean, preempted?: boolean}>}
    */
   submit(spec) {
@@ -350,12 +365,23 @@ export class EnginePool {
           stream_options: { include_usage: true },
         });
         for await (const chunk of stream) {
-          const delta = chunk.choices?.[0]?.delta?.content ?? "";
-          if (delta) {
-            job.text += delta;
-            job.onChunk(delta);
-          }
+          const choice = chunk.choices?.[0];
+          job.text += choice?.delta?.content ?? "";
+          // WebLLM's own "stop" | "length" | "abort" | "tool_calls". Kept
+          // because a caller cannot otherwise tell a natural stop from a
+          // `max_tokens` truncation.
+          if (choice?.finish_reason) job.finishReason = choice.finish_reason;
+          // Assigned, not merged: WebLLM parses the whole output message at the
+          // end and emits tool calls complete in one terminal chunk. It never
+          // streams the OpenAI-style fragments, so there is nothing to
+          // accumulate and a merge step would be machinery for a wire shape
+          // that is never produced.
+          if (choice?.delta?.tool_calls) job.toolCalls = choice.delta.tool_calls;
           if (chunk.usage) job.usage = chunk.usage;
+          // The chunk goes on verbatim. It is already a compliant OpenAI
+          // envelope carrying id / created / model / logprobs /
+          // system_fingerprint; rebuilding one downstream only loses fields.
+          job.onChunk(chunk);
         }
         this.#finish(job, {
           cancelled: Boolean(job.cancelling && !job.preempting),
@@ -380,6 +406,9 @@ export class EnginePool {
       id: job.id,
       text: job.text,
       usage: job.usage,
+      ...(job.toolCalls ? { toolCalls: job.toolCalls } : {}),
+      // Interrupted work reports "abort" whatever the stream last said.
+      finishReason: extra.cancelled || extra.preempted ? "abort" : job.finishReason,
       engineIndex: job.engineIndex,
       startedAt: job.startedAt,
       finishedAt: performance.now(),

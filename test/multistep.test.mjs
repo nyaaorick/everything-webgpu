@@ -12,7 +12,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { burstSize, clampSteps, installMultiStepDecoding } from "../src/background/multistep.js";
+import { burstSize, clampSteps, installMultiStepDecoding } from "../src/engine/multistep.js";
 
 // ------------------------------------------------------------------ fakes ---
 

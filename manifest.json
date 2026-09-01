@@ -2,7 +2,7 @@
   "manifest_version": 2,
   "name": "Everything WebGPU",
   "version": "0.1.0",
-  "description": "Local 4B+ LLM engine for Firefox on macOS. Zero-download: drag a compiled MLC model folder in, run it on WebGPU/Metal, and expose it to other extensions.",
+  "description": "Local LLM engine for Firefox on macOS. Run a compiled MLC model on WebGPU/Metal \u2014 from HuggingFace, from a URL you host, or dragged in from disk with no network at all \u2014 and expose it to other extensions.",
   "browser_specific_settings": {
     "gecko": {
       "id": "everything-webgpu@local",
@@ -28,7 +28,9 @@
   },
   "permissions": [
     "storage",
-    "unlimitedStorage"
+    "unlimitedStorage",
+    "https://huggingface.co/*",
+    "https://raw.githubusercontent.com/*"
   ],
   "content_security_policy": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self';"
 }

@@ -350,19 +350,22 @@ function discardLookahead(pipeline, state) {
   const { tvm } = pipeline;
   try {
     const popn = getPopN(pipeline);
-    if (!popn) throw new Error("kv_state_popn unavailable");
-    tvm.beginScope();
-    try {
-      for (const kvState of pipeline.getActiveKVStates()) {
-        popn(kvState, tvm.scalar(0, "int64"), tvm.scalar(n, "int32"));
+    if (popn) {
+      tvm.beginScope();
+      try {
+        for (const kvState of pipeline.getActiveKVStates()) {
+          popn(kvState, tvm.scalar(0, "int64"), tvm.scalar(n, "int32"));
+        }
+      } finally {
+        tvm.endScope();
       }
-    } finally {
-      tvm.endScope();
+      pipeline.filledKVCacheLength -= n;
+      return;
     }
-    pipeline.filledKVCacheLength -= n;
   } catch {
-    pipeline.resetChat(/* keepStats= */ true);
+    // Fall through: a trim that threw is handled the same as no trim at all.
   }
+  pipeline.resetChat(/* keepStats= */ true);
 }
 
 const popNCache = new WeakMap();

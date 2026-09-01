@@ -27,7 +27,7 @@
  * decoding is installed — the background page only ever holds a proxy.
  */
 import { WebWorkerMLCEngineHandler } from "../../vendor/web-llm.js";
-import { WORKER_CONFIGURE } from "../lib/protocol.js";
+import { WORKER_CONFIGURE } from "./constants.js";
 import { DEFAULT_DECODE_STEPS, installMultiStepDecoding } from "./multistep.js";
 
 const handler = new WebWorkerMLCEngineHandler();

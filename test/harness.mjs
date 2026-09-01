@@ -1,21 +1,18 @@
-/** Minimal in-memory stand-ins for the browser globals the extension modules use. */
-export function installBrowserGlobals() {
-  const store = new Map();
-
-  globalThis.browser = {
-    storage: {
-      local: {
-        async get(key) {
-          const keys = Array.isArray(key) ? key : [key];
-          return Object.fromEntries(keys.filter((k) => store.has(k)).map((k) => [k, store.get(k)]));
-        },
-        async set(obj) {
-          for (const [k, v] of Object.entries(obj)) store.set(k, v);
-        },
-      },
-    },
-    runtime: { id: "everything-webgpu@local" },
-  };
+/**
+ * Minimal in-memory stand-in for the one browser global the engine still
+ * reaches for directly.
+ *
+ * `browser.storage.local` used to be faked here too. It no longer needs to be:
+ * the registry goes through an injected StorageAdapter, so a test passes
+ * `memoryStorage()` instead of installing a global. Cache Storage stays a
+ * global because it is a real platform API in every host the engine targets —
+ * abstracting it would hide the cache keys, which are the contract with
+ * WebLLM's loader.
+ */
+export function installCacheStorage({ origin = "https://app.example/" } = {}) {
+  // Registration resolves relative model URLs against the page, so the tests
+  // need a page to resolve against — same as any browser host.
+  globalThis.location ??= new URL(origin);
 
   const caches = new Map();
   globalThis.caches = {
@@ -42,7 +39,7 @@ export function installBrowserGlobals() {
     },
   };
 
-  return { store, caches };
+  return { caches };
 }
 
 /** Builds a synthetic - but structurally faithful - compiled MLC model folder. */

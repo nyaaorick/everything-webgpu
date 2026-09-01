@@ -1,15 +1,17 @@
 /** Manager page: model ingestion, registry maintenance, engine settings, setup help. */
-import { ENGINE_STATE, OP, PORT_NAME, PORT_OP, PRIORITY, PROTOCOL, request } from "../lib/protocol.js";
-import {
-  formatBytes,
-  getSettings,
-  listModels,
-  removeModel,
-  setSettings,
-  verifyModelCache,
-} from "../lib/model-store.js";
-import { filesFromDataTransfer, filesFromInput, ingestModelFolder } from "../lib/ingest.js";
-import { clampSteps } from "../background/multistep.js";
+import { ENGINE_STATE, OP, PORT_NAME, PORT_OP, PRIORITY, PROTOCOL, request } from "../adapters/protocol.js";
+import { webExtensionStorage } from "../adapters/webext.js";
+import { ModelStore, formatBytes } from "../engine/model-store.js";
+import { filesFromDataTransfer, filesFromInput, ingestModelFolder } from "../engine/ingest.js";
+import { clampSteps } from "../engine/multistep.js";
+
+/**
+ * The manager page writes into the same Cache Storage and the same
+ * `browser.storage.local` the background page reads, so it builds its own
+ * ModelStore over the same adapter rather than routing registry edits through
+ * the engine. Only generation goes over the wire.
+ */
+const store = new ModelStore(webExtensionStorage());
 
 const $ = (id) => document.getElementById(id);
 
@@ -77,8 +79,8 @@ function renderGpu() {
 
 /** Spells out what another engine actually costs, from the loaded model's own record. */
 async function renderPoolCost() {
-  const { engineCount } = await getSettings();
-  const record = (await listModels()).find((m) => m.model_id === lastEngineState.modelId) ?? (await listModels())[0];
+  const { engineCount } = await store.getSettings();
+  const record = (await store.list()).find((m) => m.model_id === lastEngineState.modelId) ?? (await store.list())[0];
   if (!record) return void ($("poolCost").textContent = "");
   const weights = record.sizeBytes ?? 0;
   const total = weights * engineCount;
@@ -107,7 +109,7 @@ const TICK_MS = 100;
 const REFERENCE_STEP_MS = 7.3;
 
 async function renderDecodeCost() {
-  const { decodeSteps } = await getSettings();
+  const { decodeSteps } = await store.getSettings();
   const ticks = Math.ceil((decodeSteps * REFERENCE_STEP_MS) / TICK_MS);
   const rate = decodeSteps / ((ticks * TICK_MS) / 1000);
   const perTick = Math.floor(TICK_MS / REFERENCE_STEP_MS);
@@ -159,6 +161,7 @@ async function ingest(entries) {
 
   try {
     const record = await ingestModelFolder(entries, {
+      store,
       onProgress: ({ phase, done, total, label }) => {
         $("ingestBar").style.width = `${Math.round((done / Math.max(total, 1)) * 100)}%`;
         $("ingestStatus").textContent =
@@ -177,7 +180,7 @@ async function ingest(entries) {
 // ---------------------------------------------------------------- registry ---
 
 async function renderModels() {
-  const models = await listModels();
+  const models = await store.list();
   const tbody = $("models").querySelector("tbody");
   tbody.replaceChildren();
   $("models").hidden = models.length === 0;
@@ -208,13 +211,13 @@ async function renderModels() {
     });
     tr.querySelector('[data-act="remove"]').addEventListener("click", async () => {
       if (!confirm(`Remove "${record.model_id}" and free ${formatBytes(record.sizeBytes)} of cache?`)) return;
-      await removeModel(record.model_id);
+      await store.remove(record.model_id);
       await Promise.all([renderModels(), renderQuota()]);
     });
 
     tbody.append(tr);
 
-    verifyModelCache(record).then(({ ok, missing }) => {
+    store.verify(record).then(({ ok, missing }) => {
       const pill = tr.querySelector(".pill");
       pill.classList.add(ok ? "ok" : "bad");
       pill.textContent = ok ? "complete" : `${missing.length} missing`;
@@ -225,7 +228,7 @@ async function renderModels() {
 // ---------------------------------------------------------------- settings ---
 
 async function renderSettings() {
-  const s = await getSettings();
+  const s = await store.getSettings();
   $("temperature").value = s.temperature;
   $("maxTokens").value = s.maxTokens;
   $("engineCount").value = s.engineCount;
@@ -235,7 +238,7 @@ async function renderSettings() {
 }
 
 $("save").addEventListener("click", async () => {
-  await setSettings({
+  await store.setSettings({
     temperature: Number($("temperature").value),
     maxTokens: Number($("maxTokens").value),
     engineCount: Math.max(1, Math.min(4, Number($("engineCount").value) || 1)),
