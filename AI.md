@@ -1,7 +1,13 @@
 # Everything WebGPU — project harness
 
 ## Project Vision
-A lightweight, zero-download Firefox WebExtension optimized for macOS (WebGPU/Metal) that runs local LLMs via WebLLM using drag-and-drop local model caching. It serves as a unified local AI engine, providing a minimal test chat UI and exposing an internal API bridge for other Firefox extensions (e.g., translation, code completion).
+An embeddable local-LLM engine for the browser: WebLLM on WebGPU, plus a priority scheduler, multi-step
+decoding and compute-pass batching that together take decode from 9.7 to 25.9 tok/s. `main` is the library —
+host-neutral, no UI, usable from a page, a worker or an extension. `demo` keeps the Firefox WebExtension
+that was the original vehicle and is now the library's first consumer. See [ARCHIVE.md](ARCHIVE.md).
+
+Weights arrive by whichever route suits the app: WebLLM's 163 prebuilt models from HuggingFace, any base URL
+the developer hosts, or a local folder read off disk with no network connection at any point.
 
 **Model: `empero-ai/Qwen3.8-2B-Distill`, compiled to MLC in-house — done and running at 16.6-18.1 tok/s.** The original "4B+" goal was set before decode was instrumented; the measurements retired it. Decode is memory-bandwidth-bound, so time per token scales with weight bytes: a 4B at `q4f16_1` is ~2.25 GB and projects to 7-9 tok/s with only one engine fitting in 16 GB, while this 2B is 1.06 GB and was projected at 14-18 tok/s — the measurement landed inside that band. Build notes and the toolchain fixes are in [MLC-COMPILE.md](MLC-COMPILE.md).
 
@@ -11,22 +17,25 @@ A lightweight, zero-download Firefox WebExtension optimized for macOS (WebGPU/Me
 - **Reuse First**: Leverage existing internal APIs, built-in libraries, and ecosystem patterns (e.g., WebLLM, Cache API) before introducing net-new abstractions.
 - **Direct Execution**: Output exact code changes or direct answers. Omit preamble, pleasantries, conversational fillers, and unsolicited caveats.
 
-## Current Tasks
+## Where the work lives
 
-**Track 1 — decode efficiency.** The one measured, unclaimed win.
-- [ ] Retune the dlight GEMV schedule: more work per thread before the reduction. Measured payoff of 2 -> 32 iters/thread is **1.83x** in isolation, which would put decode near the ~41 GB/s dequant ceiling. Confirmed still untaken on the 2B build — the e2e's `decode probe` reports 639 forward kernels over 24 layers (~27 per layer), the same shape as the 0.8B. Needs a recompile; the toolchain is stood up (`tools/setup-mlc-toolchain.sh`).
+| | |
+| --- | --- |
+| [ROADMAP.md](ROADMAP.md) | **The only list of open work.** |
+| [ARCHIVE.md](ARCHIVE.md) | What was done and *why* — decisions with their reasoning, so they are not re-litigated. |
+| [WEBLLM-SURFACE.md](WEBLLM-SURFACE.md) | What WebLLM already does. **Read before adding a capability.** |
+| This file | What is true and measured. Reference, not a plan. |
 
-**Track 2 — engine work, independent of the model**
-- [ ] Batched decode. The model lib already exports `batch_decode` / `batch_prefill` / `batch_verify` and a paged KV cache; WebLLM hardcodes `defaultMaxNumSequence = 1`, `numSamples = 1`. Lifting that reads the weights once per step for N sequences — projected ~4x on the `batch` API. **No recompilation needed**, and it is now the *only* route to concurrent throughput: a second engine measured 1.06x on this model (see "Scheduling").
-- [ ] Per-priority `decodeSteps`. K=15 maximises throughput but emits 15 tokens every ~583 ms, which reads as a stall; `interactive` should use K=2-4, `background`/`batch` K=32.
-- [ ] Restore cross-turn KV reuse. Every turn currently re-prefills the whole history at a measured **5.27 ms per token**, so a turn near the 4096 context limit pays ~22 s before its first token. The fix is packing `batch_prefill_paged_kv_kernel`'s six i32 metadata buffers into one with offsets (10 bindings -> 5); the offsets already exist in its uniform block. See [MLC-COMPILE.md](MLC-COMPILE.md).
-- [ ] Ghost-text consumer extension (fixed 128-token context) on top of `session` + `priority: "interactive"`.
-- [ ] Install Ollama on the test machine and measure it on comparable weights. The "80% of Ollama" target is the only unmeasured number in the performance analysis.
-- [ ] Fix `PROFILE_PATH` in [test/e2e/run.mjs](test/e2e/run.mjs): it passes `--profile-path`, but web-ext 8 calls it `--firefox-profile` and exits with `Unknown arguments`.
-- [ ] Isolate the bench's pass-sweep onto its own device. 2048 compute passes in one encoder loses the WebGPU device (`deviceLostDuringBench`), which silently no-ops every later probe in the same run.
-- [ ] Decide MV3 migration path (event pages evict the resident engine; needs a keep-alive or an engine tab).
+Task lists used to live here, in AI2.md and in NATIVE-REUSE-PLAN.md at the same time, with "Track 1"
+and "Track 2" meaning different things in each. That is how a reader implements the wrong item, and
+it is the same shape of failure — no single place to look before acting — that produced the
+duplicated WebLLM helpers ARCHIVE.md records.
 
 ## Completed Tasks
+
+Through the in-house model compile. Everything after that — the library extraction, the model
+sources, the WebLLM de-duplication — is in [ARCHIVE.md](ARCHIVE.md) with its reasoning.
+
 - [x] Defined core requirements for local WebGPU-based execution in Firefox on macOS.
 - [x] Established direct cache-injection architecture for offline local models.
 - [x] Configured `manifest.json` (MV2, persistent background page, `wasm-unsafe-eval` CSP, `unlimitedStorage`) and documented the `about:config` flags in the manager page.
@@ -48,7 +57,9 @@ A lightweight, zero-download Firefox WebExtension optimized for macOS (WebGPU/Me
 ## Consolidated Context
 - **Target Platform**: Firefox WebExtension (macOS, requiring WebGPU flags). Test machine: M4 MacBook Air, 16 GB unified memory, ~120 GB/s.
 - **Core Stack**: JavaScript, WebGPU, WebLLM (`@mlc-ai/web-llm` 0.2.84, patched at build time), Cache API (for local file injection), Extension Message Passing.
-- **Architecture**: Background engine host + popup test UI + extension-to-extension API provider.
+- **Architecture**: A host-neutral engine (`src/engine/`, asserted free of any WebExtension API) behind
+  per-host adapters (`src/adapters/`). The Firefox extension is one host: background engine host + popup test
+  UI + extension-to-extension API provider. See [ARCHIVE.md](ARCHIVE.md).
 - **Model**: `Qwen3.8-2B-q4f16_1` (1.06 GB), compiled in-house from `empero-ai/Qwen3.8-2B-Distill` — see [MLC-COMPILE.md](MLC-COMPILE.md). `Qwen3.5-0.8B-q4f16_1-MLC` remains the baseline most of the analysis below was measured on. Keep `q4f16_1` — dequantisation measured ~free, so wider formats only add bytes, and bytes are what decode pays for.
 - **Scheduling**: one shared GPU, one engine per task, pool grows on demand. A second engine measured 1.06x on this model, so it buys isolation rather than throughput.
 - **Build-time patches** ([build.mjs](build.mjs)): `patchStorageBufferLimit` (Firefox caps storage buffers per stage at 9, tvmjs asks for 10) and `patchComputePassBatching` (one compute pass per kernel launch -> one per flush). Both fail the build loudly if their anchors stop matching after a WebLLM upgrade; `NO_PASS_MERGE=1` skips the second for A/B.
@@ -448,9 +459,32 @@ Before a model can load, set these in `about:config` and restart Firefox:
 
 The manager page shows live WebGPU status, so you can tell a flag problem from a model problem.
 
-## Adding a model (no download)
+## Adding a model
 
-Open **Models…** from the popup and drop a compiled MLC model folder. It must contain:
+Three routes, and `load()` resolves across all of them. Two of them are one call:
+
+```js
+// 1. prebuilt — one of WebLLM's 163 HuggingFace models. Nothing to register.
+await engine.load("Llama-3.2-1B-Instruct-q4f16_1-MLC");
+
+// 2. remote — any base URL you host: an HF repo, a CDN, a path on your origin, localhost.
+await engine.registerModel({
+  modelId: "Qwen3.8-2B-q4f16_1-MLC",
+  model: "/models/Qwen3.8-2B-q4f16_1-MLC/",
+  modelLib: "/models/Qwen3.8-2B-q4f16_1-MLC/Qwen3.8-2B-q4f16_1-webgpu.wasm",
+});
+
+// 3. local — read off disk. No network connection at any point, ever.
+await engine.registerModel({ modelId: "Qwen3.8-2B-q4f16_1-MLC", files });
+```
+
+`files` is `{ path, file }[]`; `filesFromDataTransfer` and `filesFromInput` build it from a drop event or a
+directory picker. `listAvailableModels()` enumerates all three; `{ prebuilt: false }` on the engine gives a
+build that can never fetch a model.
+
+In the `demo` extension this is the **Models…** page: drop a compiled MLC folder on it.
+
+A local folder must contain:
 
 - `mlc-chat-config.json`
 - `tensor-cache.json` (or a legacy `ndarray-cache.json`)
@@ -461,10 +495,18 @@ Open **Models…** from the popup and drop a compiled MLC model folder. It must 
 Grab both halves from Hugging Face — the weights from `mlc-ai/<Model>-MLC`, the matching library from
 `mlc-ai/binary-mlc-llm-libs` — or compile your own with `mlc_llm convert_weights` + `gen_config` + `compile`.
 
-Ingestion validates the whole folder **before** writing anything, then copies each file into Cache Storage.
-A missing shard fails in milliseconds rather than after 2 GB of copying.
+Local registration validates the whole folder **before** writing anything, then copies each file into Cache
+Storage. A missing shard fails in milliseconds rather than after 2 GB of copying. A remote URL is not
+validated at all — there is nothing to check without fetching, and WebLLM's loader reports a bad base URL
+far better than a HEAD request would.
 
-### How the injection works
+### How local registration works
+
+WebLLM composes every artifact URL as `new URL(relative, base)` and runs the base through `cleanModelUrl`,
+which itself calls `new URL(...)` — so the base must be absolute and resolvable. A `blob:` URL cannot serve
+as one, and there is no hook to hand the loader bytes directly. Pre-populating the cache under WebLLM's own
+scopes and keys therefore **is** its native path: the loader does its ordinary thing and finds everything
+already present.
 
 WebLLM is never told the model is local. Each model gets a synthetic base URL
 (`https://local-model.invalid/<id>/resolve/main/`) and its artifacts are written into the exact cache
@@ -476,10 +518,15 @@ scopes and keys WebLLM's loader looks up:
 | `webllm/model` | `<base>tensor-cache.json`, tokenizer, every `params_shard_*.bin` |
 | `webllm/wasm` | `<base><model>-webgpu.wasm` |
 
-`reload()` therefore finds a full cache and issues zero requests. `.invalid` is reserved by RFC 6761 and
-can never resolve, so any bug that bypasses the cache surfaces as a hard DNS failure instead of a silent
-download. `verifyModelCache()` checks every key before a load, so browser storage eviction is reported as
-"re-drop the folder" rather than a mid-load fetch.
+`reload()` therefore finds a full cache and issues zero requests. `.invalid` is reserved by RFC 6761 and can
+never resolve — so this is the *mechanism* of the offline guarantee, not a label for it: there is no bug, no
+eviction and no future refactor by which a locally-registered model reaches the network. It fails with a DNS
+error instead. `test/sources.test.mjs` asserts that structurally, checking that every URL such a record
+carries is on a `.invalid` host.
+
+`ModelStore.verify()` checks every key before a load, so storage eviction is reported as "re-register the
+folder" rather than a mid-load fetch. It gates **only** the local route: a remote or prebuilt model that
+loses its cache just re-downloads, which is slow, not fatal.
 
 `test/integration.test.mjs` pins this contract, including a guard that fails if a WebLLM upgrade renames a
 cache scope or artifact. [test/e2e/run.mjs](test/e2e/run.mjs) proves it against a real model on a real GPU:
@@ -620,11 +667,89 @@ plus their KV caches leave a 16 GB machine with nothing free, and they starve ea
 not more throughput** — and on the 2B, per the table above, a second one is not more throughput either. The
 route to concurrent throughput is batched decode inside one engine (see Current Tasks), not more engines.
 
-## API for other extensions
+## API
 
-Extension id: `everything-webgpu@local`. The manager page prints a copy-pasteable version.
+### In-process — the library
 
-Two transports, one vocabulary ([src/lib/protocol.js](src/lib/protocol.js)):
+Migrating off `@mlc-ai/web-llm` costs one line; everything after it is unchanged.
+
+```js
+-import { CreateMLCEngine } from "@mlc-ai/web-llm";
+-const engine = await CreateMLCEngine(modelId, { initProgressCallback });
++import { CreateScheduledEngine } from "everything-webgpu";
++const engine = await CreateScheduledEngine(modelId, { initProgressCallback });
+
+await engine.chat.completions.create({
+  messages, stream: true,
+  session: "ghost-text",     // added — supersedes the previous request
+  priority: "interactive",   // added — may preempt work that opted in
+});
+```
+
+`chat.completions.create()` returns WebLLM's own shapes, including its
+`"stop" | "length" | "abort"` finish reasons. What it has no room for is `cancelled` and `preempted`
+as distinct outcomes — both collapse to `"abort"` — which is why `complete()` below stays the direct
+API rather than a legacy one.
+
+The fuller surface, when you want the store, the model source, or those outcomes:
+
+```js
+import { ScheduledEngine, ModelStore } from "everything-webgpu";
+import { indexedDBStorage, ensurePersistent } from "everything-webgpu/adapters/idb";
+
+// A page origin holds weights in *evictable* storage until this is granted.
+await ensurePersistent();
+
+const engine = new ScheduledEngine({ store: new ModelStore(await indexedDBStorage()) });
+await engine.load("Llama-3.2-1B-Instruct-q4f16_1-MLC");
+
+const { text } = await engine.complete({
+  messages: [{ role: "user", content: "hi" }],
+  session: "ghost-text",
+  priority: "interactive",
+});
+```
+
+| method | what it does |
+| --- | --- |
+| `load(id, {keepResident, signal})` | bring a model up; `signal` aborts the download, partial shards kept for a free resume |
+| `use(id)` | switch between **resident** models — free, no reload |
+| `unload(id?)` / `unloadAll()` | free VRAM, **keep the cached bytes** |
+| `resident` | model ids with a live pool right now |
+| `store.evict(id)` | free the disk, **keep the record** so it can be re-fetched |
+| `remove(id)` | forget it entirely — frees bytes for **every** source, then drops the record |
+| `chat.completions.create` | streamed chunks are WebLLM's own, verbatim: `tool_calls`, `logprobs`, stable `created` |
+| `store.cacheState(rec)` | `"cached"` / `"partial"` / `"absent"` |
+| `estimateSpeed(id?)` | projected tok/s, measured once anything has decoded |
+| `features()` | what is actually switched on: KV reuse, decode steps, engines |
+| `complete(req, onChunk?)` | one completion; `onChunk` streams deltas |
+| `batch(req, onItem?)` | many independent prompts as **one task** — see below |
+| `cancel(idOrSession)` | by job id or session key; returns how many it stopped |
+| `configure({ decodeSteps })` | retune a live engine, no reload |
+| `registerModel(spec)` | a base URL, or local `files` |
+| `listModels()` / `listAvailableModels()` | registered only (cheap) / all three routes |
+| `subscribe(fn)` | lifecycle changes; returns an unsubscribe |
+| `state` / `hasWebGPU` | current snapshot, WebGPU presence |
+| `chat.completions.create(req)` | the WebLLM/OpenAI facade over `complete()` |
+| `probe()` | WebGPU, adapter, `shader-f16`, limits, storage quota — cached |
+| `canRun(modelId)` | `{ ok, blockers, warnings }`, before anything is downloaded |
+| `recommendModels({maxVramMB, prefer})` | rank the 163 prebuilt models for *this* device |
+
+Failures are `EngineError { code, message, detail }` — `NO_WEBGPU`, `NO_MODEL`, `UNKNOWN_MODEL`,
+`CACHE_INCOMPLETE`, `INVALID_MODEL_FOLDER`, `BAD_REQUEST`, `GENERATION_FAILED`. `detail` carries the
+structured context (the evicted keys, the missing field, why a folder was rejected), so no caller
+parses a message. Over the wire the code rides beside `error`, which stays a plain string.
+
+Generation ops take `messages`, `temperature`, `max_tokens`, `response_format` and `extra_body` — the
+OpenAI shape WebLLM already speaks — plus the scheduling fields `task`, `session`, `priority` and
+`preemptible`, which are what this adds over calling WebLLM directly.
+
+### Over a wire — the WebExtension adapter
+
+Only for the case where the engine and the caller are in different processes. Extension id:
+`everything-webgpu@local`; the manager page prints a copy-pasteable version.
+
+Two transports, one vocabulary ([src/adapters/protocol.js](src/adapters/protocol.js)):
 
 - `browser.runtime.sendMessage(id, req)` — request/response. Ops: `status`, `listModels`, `load`,
   `unload`, `chat`, `batch`, `cancel`, `configure`.
@@ -644,7 +769,9 @@ if you want `translate()` ergonomics — just keep it on your side of `sendMessa
 
 ### The three shapes of work
 
-What differs between these is *not* the op. It is who owns an engine, and what may interrupt what.
+What differs between these is *not* the op or the transport. It is who owns an engine, and what may
+interrupt what. The examples below use the wire form; in-process the same fields go to `complete()` and
+`batch()`.
 
 | | op | priority | key fields | why |
 | --- | --- | --- | --- | --- |
@@ -736,32 +863,62 @@ with extension ids to restrict access.
 | Path | Role |
 | --- | --- |
 | [manifest.json](manifest.json) | MV2, persistent background page, `wasm-unsafe-eval` CSP |
-| [src/background/background.js](src/background/background.js) | Engine host + message/port router |
-| [src/background/pool.js](src/background/pool.js) | Engine pool + priority scheduler |
-| [src/background/engine-worker.js](src/background/engine-worker.js) | One pool slot's engine, in its own realm |
-| [src/background/multistep.js](src/background/multistep.js) | Multi-step decoding: K forward steps per GPU sync |
-| [src/lib/ingest.js](src/lib/ingest.js) | Folder validation and cache injection |
-| [src/lib/model-store.js](src/lib/model-store.js) | Cache layout, registry, settings |
-| [src/lib/protocol.js](src/lib/protocol.js) | Wire protocol shared by every surface |
-| [src/popup/](src/popup/) | Minimal test chat |
-| [src/manager/](src/manager/) | Drop target, registry, settings, setup help |
+| [src/engine/index.js](src/engine/index.js) | Public entry point of the library |
+| [src/engine/create.js](src/engine/create.js) | `CreateScheduledEngine` — the one-line swap for `CreateMLCEngine` |
+| [src/engine/chat.js](src/engine/chat.js) | `chat.completions.create()`, the WebLLM/OpenAI facade |
+| [src/engine/errors.js](src/engine/errors.js) | `EngineError` and the seven codes |
+| [src/engine/device.js](src/engine/device.js) | Hardware probe, `canRun`, model ranking |
+| [src/engine/engine.js](src/engine/engine.js) | `ScheduledEngine` — the engine with no transport attached |
+| [src/engine/pool.js](src/engine/pool.js) | Engine pool + priority scheduler |
+| [src/engine/engine-worker.js](src/engine/engine-worker.js) | One pool slot's engine, in its own realm |
+| [src/engine/multistep.js](src/engine/multistep.js) | Multi-step decoding: K forward steps per GPU sync |
+| [src/engine/ingest.js](src/engine/ingest.js) | Folder validation and cache injection |
+| [src/engine/model-store.js](src/engine/model-store.js) | Cache layout, registry, settings, `StorageAdapter`, the three model sources |
+| [src/engine/constants.js](src/engine/constants.js) | `PRIORITY`, `ENGINE_STATE` — engine vocabulary, transport-free |
+| [src/adapters/protocol.js](src/adapters/protocol.js) | Wire protocol: `PROTOCOL`, `OP`, `PORT_OP` |
+| [src/adapters/webext.js](src/adapters/webext.js) | `browser.storage.local` + the message/port router |
+| [src/adapters/idb.js](src/adapters/idb.js) | IndexedDB `StorageAdapter` + `ensurePersistent()`, for pages |
+| [src/adapters/memory.js](src/adapters/memory.js) | In-memory `StorageAdapter`, for tests |
+| [src/background/background.js](src/background/background.js) | The extension host: build an engine, attach the transport |
+| [src/popup/](src/popup/) | Minimal test chat (moves to `demo` in Phase 4) |
+| [src/manager/](src/manager/) | Drop target, registry, settings, setup help (moves to `demo` in Phase 4) |
 | [test/integration.test.mjs](test/integration.test.mjs) | The cache-injection contract |
 | [test/scheduler.test.mjs](test/scheduler.test.mjs) | Priority, supersession, preemption and pool growth, GPU-free |
+| [test/sources.test.mjs](test/sources.test.mjs) | How `load()` resolves prebuilt / remote / injected, in what order it refuses, and that a local model has no reachable URL |
+| [test/errors.test.mjs](test/errors.test.mjs) | That failures carry the right code, and that nothing throws an untyped Error |
+| [test/chat.test.mjs](test/chat.test.mjs) | That the WebLLM facade really is drop-in, shape by shape |
+| [test/device.test.mjs](test/device.test.mjs) | The compatibility rules, and that blockers and warnings stay distinct |
+| [test/manage.test.mjs](test/manage.test.mjs) | The four model states, and that unload / evict / remove stay distinct |
 | [test/e2e/](test/e2e/) | Real-hardware end-to-end run (`npm run e2e`) |
 | [test/e2e/bench.mjs](test/e2e/bench.mjs) | Standalone WebGPU sync-latency benchmark (`npm run bench`) |
 | [MLC-COMPILE.md](MLC-COMPILE.md) | How the model was compiled, and every toolchain breakage on the way |
 | [tools/](tools/) | Model-compilation toolchain: setup, nightly patches, weight strip, wasm audits |
+| [WEBLLM-SURFACE.md](WEBLLM-SURFACE.md) | What WebLLM already does, what we add, and where the line is. **Read before adding a capability.** |
+| [ROADMAP.md](ROADMAP.md) | The only list of open work |
+| [ARCHIVE.md](ARCHIVE.md) | What was done and why — the extraction, the model sources, the de-duplication |
 
-The engine lives in the MV2 persistent background page — a real document on the extension origin, so it has
-both `navigator.gpu` and the same Cache Storage the manager page writes to. The model stays resident in VRAM
-across popup opens and across calls from other extensions.
+`src/engine/` references no WebExtension API — asserted by a test, because that claim is only broken in the
+host nobody ran. The three places the host used to leak in are injected: a `StorageAdapter` for the registry,
+a worker URL, and the WebLLM import. `src/adapters/` holds one implementation of each per host. See
+[ARCHIVE.md](ARCHIVE.md).
+
+In *this* host the engine lives in the MV2 persistent background page — a real document on the extension
+origin, so it has both `navigator.gpu` and the same Cache Storage the manager page writes to. The model stays
+resident in VRAM across popup opens and across calls from other extensions.
 
 ## Known limits
 
 - **AMO signing**: `vendor/web-llm.js` is ~6 MB, over `web-ext lint`'s 5 MB parse limit. Fine for temporary
   install and self-distribution; it would need splitting before an AMO listing.
 - **MV2**: MV3 event pages get evicted, which would unload a multi-GB model between calls. Migrating needs a
-  keep-alive or a dedicated engine tab.
+  keep-alive or a dedicated engine tab. This constrains `demo` only — the library is host-agnostic.
+- **Storage eviction off an extension origin**: an ordinary page has no `unlimitedStorage`, so a multi-GB
+  model is evictable until `ensurePersistent()` is granted. For a prebuilt or remote model that means a slow
+  reload; for a locally-registered one it is fatal and it must be re-registered. Unmeasured: the exact quota
+  and grant behaviour per browser.
+- **Never run outside a Firefox extension**: the library is written against capabilities rather than
+  browsers, and should be *faster* on Chrome (KV reuse is not disabled there — see "Multi-step decoding").
+  Both claims are predictions. See ROADMAP.md, Gates A and B.
 - **Thinking burns the budget**: this model opens every reply with a `<think>` block — it is a reasoning
   distill and its card says so. At ~17 tok/s that is seconds of nothing before the answer starts. For
   translation and completion, suppress it in your prompt, or rebuild the config with the `qwen3_5_nothink`
