@@ -3,6 +3,8 @@
  *   node build.mjs                 bundle WebLLM into vendor/ (the only build step
  *                                  the extension needs - our own code ships as
  *                                  plain ES modules and is loaded as-is)
+ *   node build.mjs --verify-patches check the patch anchors against the current
+ *                                  bundle and exit; no rebuild, no rewrite
  *   node build.mjs --check-entries type-free sanity pass: every extension entry
  *                                  point must parse and resolve its imports
  *   node build.mjs --minify        same, minified
@@ -10,12 +12,18 @@
  */
 import { build } from "esbuild";
 import { execFile } from "node:child_process";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { promisify } from "node:util";
+
+import { PATCHES, explainFailures, verifyPatches } from "./build/patches.mjs";
 
 const flag = (name) => process.argv.includes(name);
 
-if (!flag("--check-entries") && !flag("--zip")) {
+const BUNDLE = "vendor/web-llm.js";
+const MANIFEST = "build/patch-manifest.json";
+
+// `--verify-patches` is read-only: it must not rewrite vendor/ as a side effect.
+if (!flag("--check-entries") && !flag("--zip") && !flag("--verify-patches")) {
   mkdirSync("vendor", { recursive: true });
   await build({
     entryPoints: ["node_modules/@mlc-ai/web-llm/lib/index.js"],
@@ -31,107 +39,121 @@ if (!flag("--check-entries") && !flag("--zip")) {
     minify: flag("--minify"),
     logLevel: "info",
   });
-  patchStorageBufferLimit();
-  if (process.env.NO_PASS_MERGE) {
-    console.log("skipped compute-pass batching (NO_PASS_MERGE set)");
-  } else {
-    patchComputePassBatching();
-  }
+  applyPatches();
 }
 
 /**
- * Firefox compatibility shim.
+ * Verify every anchor, then rewrite.
  *
- * tvmjs hardcodes a request for 10 storage buffers per shader stage ("default
- * is 8"). Firefox's Metal backend caps `maxStorageBuffersPerShaderStage` at 9,
- * so `detectGPUDevice()` throws before a device is ever requested. Clamping to
- * what the adapter actually reports lets the device be created; kernels that
- * genuinely need the 10th binding still fail later, loudly, at pipeline
- * creation.
+ * Verification is separated from application on purpose. Rewriting as it goes
+ * would leave a half-patched bundle behind on the first failure, and would
+ * report only that failure — when what you want after a version bump is the
+ * whole list at once, before anything has been touched.
  */
-function patchStorageBufferLimit() {
-  const path = "vendor/web-llm.js";
-  const before = "const requiredMaxStorageBuffersPerShaderStage = 10;";
-  const after =
-    "const requiredMaxStorageBuffersPerShaderStage = Math.min(10, adapter.limits.maxStorageBuffersPerShaderStage);";
-  const src = readFileSync(path, "utf8");
-  if (!src.includes(before)) {
-    throw new Error(
-      `${path}: storage-buffer limit shim did not match. WebLLM changed detectGPUDevice() - re-check build.mjs.`,
+function applyPatches() {
+  let source = readFileSync(BUNDLE, "utf8");
+  const installed = JSON.parse(
+    readFileSync("node_modules/@mlc-ai/web-llm/package.json", "utf8"),
+  ).version;
+  const manifest = existsSync(MANIFEST) ? JSON.parse(readFileSync(MANIFEST, "utf8")) : null;
+  const bumped = manifest && manifest.webllmVersion !== installed;
+
+  const { ok, applicable, failures } = verifyPatches(source);
+  const anchors = applicable.reduce((n, p) => n + p.edits.length, 0);
+
+  if (bumped) {
+    console.log(
+      `\n  WebLLM ${manifest.webllmVersion} -> ${installed}: verifying ${anchors} anchor(s) ` +
+        `across ${applicable.length} patch(es)\n`,
     );
   }
-  writeFileSync(path, src.replace(before, after));
-  console.log("applied Firefox storage-buffer limit shim");
+
+  for (const patch of PATCHES) {
+    if (patch.skipWhen?.()) console.log(`skipped ${patch.id} (NO_PASS_MERGE set)`);
+  }
+
+  if (!ok) {
+    const header = bumped
+      ? `WebLLM ${manifest.webllmVersion} -> ${installed} moved code these patches rewrite.`
+      : "The bundle no longer matches the patch anchors.";
+    throw new Error(
+      `${header}\n${explainFailures(failures)}\n\n` +
+        "  Re-anchor in build/patches.mjs using the lines above, then re-run `npm run build`.\n" +
+        "  To build without compute-pass batching for an A/B, set NO_PASS_MERGE=1.\n",
+    );
+  }
+
+  for (const patch of applicable) {
+    for (const edit of patch.edits) source = source.replace(edit.before, edit.after);
+    console.log(`applied ${patch.id}`);
+  }
+  writeFileSync(BUNDLE, source);
+
+  writeFileSync(
+    MANIFEST,
+    `${JSON.stringify(
+      {
+        webllmVersion: installed,
+        appliedAt: new Date().toISOString(),
+        // Recorded so a future failure can show what the anchor used to be,
+        // not just that it stopped matching.
+        anchors: applicable.map((p) => ({ patch: p.id, before: p.edits.map((e) => e.before) })),
+      },
+      null,
+      2,
+    )}\n`,
+  );
+  if (bumped) console.log(`\n  all anchors held; patch-manifest.json now records ${installed}\n`);
 }
 
 /**
- * Batch consecutive kernel launches into one WebGPU compute pass.
- *
- * tvmjs opens a fresh pass per kernel launch (`submitShader`: beginComputePass ->
- * setPipeline -> createBindGroup -> dispatch -> end). Measured on an M4 Air
- * (README, "Where the 46 ms goes"), that is the dominant cost of decode:
- *
- *   - a compute *pass* costs ~100 us; a dispatch inside one is free
- *     (`npm run bench`: 2048 dispatches = 104 ms in one pass, 309 ms in 2048)
- *   - decode issues 664 kernels/token but only 16 flushes/token, so ~41
- *     consecutive launches share an encoder and are each paying for their own
- *     pass for no reason
- *
- * Dispatches within one pass are safe to merge: WebGPU gives a compute pass a
- * usage scope *per dispatch*, so implementations must insert barriers between
- * them. The bench shader confirms it — 2048 dispatches with a genuine
- * read-after-write hazard on one buffer still measured free.
- *
- * The pass is closed in `flushCommands()`, which is already the single
- * chokepoint every operation that cannot run mid-pass (buffer copies, frees,
- * submits, sync) routes through.
- *
- * Set NO_PASS_MERGE=1 to build without this, for an A/B on one machine.
+ * Both rewrites, and the reasoning behind each, live in
+ * [build/patches.mjs](build/patches.mjs) as data rather than as a pair of
+ * functions that each hand-rolled its own anchor check. `npm run verify-patches`
+ * checks them against the current bundle without rebuilding.
  */
-function patchComputePassBatching() {
-  const path = "vendor/web-llm.js";
-  /** Cap so one pass can never grow unbounded; 41/flush is the measured norm. */
-  const maxDispatchesPerPass = 1024;
-  const edits = [
-    // Reuse the open pass instead of beginning one per launch.
-    [
-      "const compute = this.pendingEncoder.beginComputePass();",
-      "if (!this.pendingComputePass) { this.pendingComputePass = this.pendingEncoder.beginComputePass(); } " +
-        "const compute = this.pendingComputePass;",
-    ],
-    // Do not end it per launch; only guard against an unbounded pass.
-    [
-      "compute.end();",
-      `if (this.pendingDispatchCount >= ${maxDispatchesPerPass}) this.flushCommands();`,
-    ],
-    // Close it exactly where the encoder is submitted.
-    [
-      "this.device.queue.submit([this.pendingEncoder.finish()]);",
-      "if (this.pendingComputePass) { this.pendingComputePass.end(); this.pendingComputePass = null; } " +
-        "this.device.queue.submit([this.pendingEncoder.finish()]);",
-    ],
-  ];
 
-  let src = readFileSync(path, "utf8");
-  for (const [before, after] of edits) {
-    // Each anchor is unique in the bundle; if that stops holding, the patch
-    // could land in the wrong place, so refuse rather than guess.
-    const hits = src.split(before).length - 1;
-    if (hits !== 1) {
-      throw new Error(
-        `${path}: compute-pass batching expected exactly 1 match for ${JSON.stringify(before)}, found ${hits}. ` +
-          "WebLLM changed tvmjs's WebGPUContext - re-check build.mjs, or build with NO_PASS_MERGE=1.",
-      );
-    }
-    src = src.replace(before, after);
+if (flag("--verify-patches")) {
+  // Bundles fresh rather than reading vendor/. The anchors are `before` text,
+  // which a successful patch has by definition consumed — checking them against
+  // an already-patched bundle can only ever fail. The question this answers is
+  // "do our anchors still match the installed WebLLM", so it needs the
+  // installed WebLLM, not our output.
+  const fresh = await build({
+    entryPoints: ["node_modules/@mlc-ai/web-llm/lib/index.js"],
+    bundle: true,
+    write: false,
+    format: "esm",
+    platform: "browser",
+    target: ["firefox115"],
+    legalComments: "none",
+    logLevel: "silent",
+  });
+  const installed = JSON.parse(
+    readFileSync("node_modules/@mlc-ai/web-llm/package.json", "utf8"),
+  ).version;
+  const { ok, applicable, failures } = verifyPatches(fresh.outputFiles[0].text);
+  const anchors = applicable.reduce((n, p) => n + p.edits.length, 0);
+  if (!ok) {
+    throw new Error(
+      `patch anchors do not match @mlc-ai/web-llm ${installed}:\n${explainFailures(failures)}`,
+    );
   }
-  writeFileSync(path, src);
-  console.log(`applied compute-pass batching (max ${maxDispatchesPerPass} dispatches/pass)`);
+  console.log(
+    `${anchors} patch anchor(s) match @mlc-ai/web-llm ${installed} across ${applicable.length} patch(es)`,
+  );
 }
 
 if (flag("--check-entries")) {
   await build({
     entryPoints: [
+      // The library entry first: it is the one that must keep resolving for a
+      // consumer who never loads the extension surfaces at all.
+      "src/engine/index.js",
+      "src/engine/engine-worker.js",
+      "src/adapters/webext.js",
+      "src/adapters/idb.js",
+      "src/adapters/memory.js",
       "src/background/background.js",
       "src/popup/popup.js",
       "src/manager/manager.js",

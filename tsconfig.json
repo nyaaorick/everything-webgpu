@@ -1,0 +1,30 @@
+{
+  "//": "Type declarations only. The source stays plain ESM JavaScript; the JSDoc it already carries is the type source, so `npm run types` adds a typed surface for consumers without a rewrite or a build step on the runtime path.",
+  "compilerOptions": {
+    "allowJs": true,
+    "checkJs": false,
+    "declaration": true,
+    "emitDeclarationOnly": true,
+    "outDir": "types",
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": [
+      "ES2022",
+      "DOM",
+      "DOM.Iterable",
+      "WebWorker"
+    ],
+    "skipLibCheck": true,
+    "strict": false,
+    "rootDir": "src"
+  },
+  "include": [
+    "src/engine/**/*.js",
+    "src/adapters/**/*.js"
+  ],
+  "exclude": [
+    "src/engine/engine-worker.js",
+    "vendor"
+  ]
+}

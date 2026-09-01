@@ -1,23 +1,58 @@
 {
   "name": "everything-webgpu",
   "version": "0.1.0",
-  "description": "Firefox WebExtension that runs local MLC/WebLLM models on WebGPU with drag-and-drop cache injection.",
+  "description": "Firefox WebExtension and embeddable library that runs local MLC/WebLLM models on WebGPU, with a priority scheduler, multi-step decoding, and models from HuggingFace, your own URL, or injected straight from disk.",
   "scripts": {
     "build": "node build.mjs",
     "check": "node build.mjs --check-entries",
-    "test": "node --test test/integration.test.mjs test/scheduler.test.mjs test/multistep.test.mjs",
+    "test": "node --test test/webllm-contract.test.mjs test/integration.test.mjs test/scheduler.test.mjs test/multistep.test.mjs test/sources.test.mjs test/errors.test.mjs test/chat.test.mjs test/device.test.mjs test/manage.test.mjs",
     "package": "npm run build && node build.mjs --zip",
     "e2e": "node test/e2e/run.mjs",
-    "bench": "node test/e2e/bench.mjs"
+    "bench": "node test/e2e/bench.mjs",
+    "types": "tsc -p tsconfig.json",
+    "prepublishOnly": "npm run build && npm run types && npm test",
+    "contract": "node --test test/webllm-contract.test.mjs",
+    "verify-patches": "node build.mjs --verify-patches"
   },
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "@mlc-ai/web-llm": "^0.2.84"
+    "@mlc-ai/web-llm": "0.2.84"
   },
   "devDependencies": {
-    "esbuild": "^0.28.2"
+    "esbuild": "^0.28.2",
+    "typescript": "^5.9.2"
   },
   "type": "module",
-  "private": true
+  "private": true,
+  "types": "types/engine/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./types/engine/index.d.ts",
+      "default": "./src/engine/index.js"
+    },
+    "./worker": "./src/engine/engine-worker.js",
+    "./adapters/idb": {
+      "types": "./types/adapters/idb.d.ts",
+      "default": "./src/adapters/idb.js"
+    },
+    "./adapters/memory": {
+      "types": "./types/adapters/memory.d.ts",
+      "default": "./src/adapters/memory.js"
+    },
+    "./adapters/webext": {
+      "types": "./types/adapters/webext.d.ts",
+      "default": "./src/adapters/webext.js"
+    },
+    "./adapters/protocol": {
+      "types": "./types/adapters/protocol.d.ts",
+      "default": "./src/adapters/protocol.js"
+    }
+  },
+  "files": [
+    "src/engine",
+    "src/adapters",
+    "types",
+    "vendor"
+  ]
 }

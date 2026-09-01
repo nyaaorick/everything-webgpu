@@ -8,3 +8,5 @@ model/
 dist/
 # In-house MLC toolchain venv (GBs; rebuild with tools/setup-mlc-toolchain.sh).
 .venv-mlc/
+# Generated from JSDoc by `npm run types`.
+types/

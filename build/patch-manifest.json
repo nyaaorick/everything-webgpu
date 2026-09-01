@@ -1,0 +1,20 @@
+{
+  "webllmVersion": "0.2.84",
+  "appliedAt": "2026-09-01T00:16:28.948Z",
+  "anchors": [
+    {
+      "patch": "storage-buffer-limit",
+      "before": [
+        "const requiredMaxStorageBuffersPerShaderStage = 10;"
+      ]
+    },
+    {
+      "patch": "compute-pass-batching",
+      "before": [
+        "const compute = this.pendingEncoder.beginComputePass();",
+        "compute.end();",
+        "this.device.queue.submit([this.pendingEncoder.finish()]);"
+      ]
+    }
+  ]
+}
