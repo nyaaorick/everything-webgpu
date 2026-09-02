@@ -29,11 +29,15 @@ What the swap buys:
 
 ## Status
 
-Pre-1.0. ESM only (`"type": "module"`).
+**On npm** — `npm i everything-webgpu`. Pre-1.0, ESM only (`"type": "module"`).
+
+```sh
+npm i everything-webgpu
+```
 
 `vendor/web-llm.js` — the patched WebLLM bundle the engine loads — is a **build product and is not
-checked in**, so every install route has to produce it. `prepare` does that automatically for a git
-dependency and for a clone; a published tarball ships it prebuilt. If it is ever missing you get
+checked in**, so every install route has to produce it. The published tarball ships it prebuilt;
+`prepare` regenerates it for a git dependency or a clone. If it is ever missing you get
 `PACKAGE_INCOMPLETE` naming the fix, rather than a module-resolution error pointing inside this
 package.
 

@@ -18,6 +18,12 @@
   },
   "author": "nyaaorick",
   "license": "ISC",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nyaaorick/everything-webgpu.git"
+  },
+  "homepage": "https://github.com/nyaaorick/everything-webgpu#readme",
+  "bugs": "https://github.com/nyaaorick/everything-webgpu/issues",
   "dependencies": {
     "@mlc-ai/web-llm": "0.2.84"
   },
