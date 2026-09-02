@@ -1,0 +1,14 @@
+# everything-webgpu
+
+> Run local MLC/WebLLM models on WebGPU in the browser with a priority scheduler, multi-step decoding, and zero-network disk loading.
+
+## Documentation
+- [Quick Start](https://github.com/nyaaorick/everything-webgpu#quick-start--four-lines): 4-line engine initialization.
+- [API Reference](https://github.com/nyaaorick/everything-webgpu/blob/main/API.md): Comprehensive API catalog and error specifications.
+- [Benchmarks & Architecture](https://github.com/nyaaorick/everything-webgpu/blob/main/AI.md): Measured performance, Firefox patch analysis, and scheduler design.
+
+## Core Capabilities
+- **Scheduler**: Interactive, normal, and background priority bands with session-based supersession for ghost-text autocompletion.
+- **Multi-step Decoding**: Aggregates K forward steps per GPU sync, increasing 0.8B decode speed from 9.6 to 25.9 tok/s.
+- **Offline Disk Loading**: Direct model ingestion via Drag-and-Drop or HTML directory inputs with zero network dependency.
+- **Firefox WebGPU Patches**: Overcomes the 9-storage-buffer cap and flushes compute passes efficiently.
