@@ -1,5 +1,7 @@
 # everything-webgpu
 
+[![npm version](https://img.shields.io/npm/v/everything-webgpu.svg?color=cb3837)](https://www.npmjs.com/package/everything-webgpu) [![License: ISC](https://img.shields.io/badge/License-ISC-blue.svg)](https://opensource.org/licenses/ISC) [![WebGPU](https://img.shields.io/badge/WebGPU-Enabled-orange.svg)](https://developer.mozilla.org/en-US/docs/Web/API/WebGPU_API) [![Bundle Size](https://img.shields.io/badge/Entry-53_kB-brightgreen.svg)](https://www.npmjs.com/package/everything-webgpu)
+
 Run local MLC/WebLLM models on WebGPU, in a browser, with a scheduler in front of them.
 
 **Migrating off `@mlc-ai/web-llm` is one line.**
