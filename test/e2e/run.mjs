@@ -38,21 +38,33 @@ if (!existsSync(MODEL_DIR)) {
 }
 
 /**
- * Snapshot the *clean* tree. A run killed mid-flight leaves the patches behind,
- * so strip them first - otherwise the dirty state becomes the restore target.
+ * Snapshot the *clean* tree.
+ *
+ * A run killed mid-flight leaves the patches behind, so they are stripped first
+ * — otherwise the dirty state becomes the restore target.
+ *
+ * But only when they are actually there. `JSON.parse`/`stringify` rewrites
+ * `\uXXXX` escapes as literal UTF-8, so round-tripping an already-clean
+ * manifest left a cosmetic one-line diff after **every** run. That is worse
+ * than untidy: it trains you to ignore a dirty tree after an e2e, which is
+ * exactly when you want to notice one. A clean file is restored byte-for-byte.
  */
-function unpatch(manifestSrc, bgSrc) {
-  const manifest = JSON.parse(manifestSrc);
-  manifest.permissions = manifest.permissions.filter((p) => !p.startsWith("http://127.0.0.1"));
-  return {
-    manifest: JSON.stringify(manifest, null, 2) + "\n",
-    bg: bgSrc.split("\n").filter((l) => !l.includes("devtest")).join("\n"),
-  };
-}
+const manifestRaw = readFileSync(MANIFEST, "utf8");
+const bgRaw = readFileSync(BG_HTML, "utf8");
 
-const clean = unpatch(readFileSync(MANIFEST, "utf8"), readFileSync(BG_HTML, "utf8"));
-const manifestBefore = clean.manifest;
-const bgBefore = clean.bg;
+const manifestDirty = JSON.parse(manifestRaw).permissions.some((p) => p.startsWith("http://127.0.0.1"));
+const bgDirty = bgRaw.includes("devtest");
+
+const manifestBefore = manifestDirty
+  ? (() => {
+      const m = JSON.parse(manifestRaw);
+      m.permissions = m.permissions.filter((p) => !p.startsWith("http://127.0.0.1"));
+      return JSON.stringify(m, null, 2) + "\n";
+    })()
+  : manifestRaw;
+const bgBefore = bgDirty
+  ? bgRaw.split("\n").filter((l) => !l.includes("devtest")).join("\n")
+  : bgRaw;
 let firefox;
 let server;
 

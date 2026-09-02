@@ -1,6 +1,6 @@
 {
   "webllmVersion": "0.2.84",
-  "appliedAt": "2026-09-01T00:16:28.948Z",
+  "appliedAt": "2026-09-02T07:08:04.487Z",
   "anchors": [
     {
       "patch": "storage-buffer-limit",

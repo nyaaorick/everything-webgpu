@@ -74,6 +74,8 @@ export {
 } from "./model-store.js";
 
 export { filesFromDataTransfer, filesFromInput, ingestModelFolder } from "./ingest.js";
+export { prefetchModel, resolveModelUrl } from "./prefetch.js";
+export { ask, conversation, ghostText } from "./recipes.js";
 
 export {
   DEFAULT_DECODE_STEPS,
@@ -83,4 +85,5 @@ export {
   installMultiStepDecoding,
 } from "./multistep.js";
 
-export { ENGINE_STATE, PRIORITY, PRIORITY_ORDER, WORKER_CONFIGURE } from "./constants.js";
+export { ENGINE_STATE, PRIORITY, PRIORITY_ORDER, UNLOAD_LEVEL, WORKER_CONFIGURE } from "./constants.js";
+export { SEVERITY } from "./environment.js";

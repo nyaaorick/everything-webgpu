@@ -54,6 +54,17 @@ try {
   const L = adapter.limits;
   log(`limits: storageBuffersPerStage=${L.maxStorageBuffersPerShaderStage} bufferSize=${Math.round(L.maxBufferSize / 2 ** 20)}MB storageBinding=${Math.round(L.maxStorageBufferBindingSize / 2 ** 20)}MB workgroupStorage=${L.maxComputeWorkgroupStorageSize}`);
 
+  // Bindings `batch_prefill_paged_kv_kernel` needs; mirrors engine-worker.js.
+  // Below this, cross-turn KV reuse is off and the multiround check below can
+  // only compare ragged against ragged.
+  const PAGED_PREFILL_BUFFERS = 10;
+  const storageBuffers = L.maxStorageBuffersPerShaderStage;
+  const pagedPrefillPossible = storageBuffers >= PAGED_PREFILL_BUFFERS;
+  log(
+    `kv reuse: ${pagedPrefillPossible ? "available" : "DISABLED"} ` +
+      `(${storageBuffers} storage buffers, paged prefill needs ${PAGED_PREFILL_BUFFERS})`,
+  );
+
   // What the pool has to size itself against. The answer on Firefox is
   // "nothing": `deviceMemory` and `performance.memory` are Blink-only, and
   // `storage.estimate()` reports disk quota, not RAM. This line exists so that
@@ -240,11 +251,31 @@ try {
     log(`multiround turn1 (${turn1.usage?.completion_tokens} tok): ${JSON.stringify(turn1.text.slice(-50))}`);
     log(`  with KV reuse   (paged prefill):  ${JSON.stringify(reused.text.slice(0, 60))}`);
     log(`  forced reprefill (ragged prefill): ${JSON.stringify(refreshed.text.slice(0, 60))}`);
-    log(
-      same
-        ? "multiround verdict: identical — paged prefill is fine"
-        : "multiround verdict: DIVERGED — KV reuse is broken; batch_prefill_paged_kv_kernel wants 10 storage buffers and Firefox allows 9",
-    );
+
+    // What this comparison actually proves depends on the device, and saying
+    // otherwise is worse than not checking.
+    //
+    // `engine-worker.js` forces `resetChat()` on every prefill when the adapter
+    // allows fewer than PAGED_PREFILL_BUFFERS, so on such a device *both*
+    // branches above run the ragged kernel. "identical" is then guaranteed and
+    // says nothing about paged prefill — which is exactly what this line used
+    // to claim. On the reference M4 (9 buffers) it has never been otherwise, so
+    // the paged path has never actually been exercised here.
+    if (!pagedPrefillPossible) {
+      log(
+        `multiround verdict: ${same ? "identical" : "DIVERGED"} — but UNVERIFIED for paged prefill: ` +
+          `this device allows ${storageBuffers} storage buffers and paged prefill needs ` +
+          `${PAGED_PREFILL_BUFFERS}, so both branches ran the ragged kernel. ` +
+          "Run on a >=10-buffer device (Chrome) to exercise the paged path.",
+      );
+      if (!same) throw new Error("two ragged re-prefills of the same history diverged");
+    } else {
+      log(
+        same
+          ? "multiround verdict: identical — paged prefill is fine"
+          : "multiround verdict: DIVERGED — KV reuse is broken; batch_prefill_paged_kv_kernel wants 10 storage buffers and Firefox allows 9",
+      );
+    }
   }
 
   // 5a3. What re-prefilling actually costs.

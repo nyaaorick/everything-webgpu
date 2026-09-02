@@ -37,24 +37,84 @@ import { ModelStore } from "./model-store.js";
 export async function CreateScheduledEngine(modelId, opts = {}) {
   const { store, initProgressCallback, ...rest } = opts;
   const engine = new ScheduledEngine({ ...rest, store: store ?? (await defaultStore()) });
+  if (!modelId) return engine;
 
-  if (initProgressCallback) {
-    // The engine reports progress through its own lifecycle stream; WebLLM
-    // reports it through a callback. Forward only the load reports, so a
-    // caller's callback fires exactly when WebLLM's would have.
-    const stop = engine.subscribe((state) => {
-      if (state.progress) initProgressCallback(state.progress);
-    });
-    try {
-      if (modelId) await engine.load(modelId);
-    } finally {
-      stop();
-    }
+  // Three states, not two. `undefined` means the caller did not choose, and the
+  // right default for a call that blocks for minutes on a multi-hundred-MB
+  // download is to say so: the first run of the three-line example otherwise
+  // looks exactly like a hung process, which is the worst possible first
+  // impression and the one thing no amount of documentation undoes. `null` is
+  // how you ask for silence.
+  const report =
+    initProgressCallback === undefined ? defaultProgressReporter(modelId) : initProgressCallback;
+
+  if (!report) {
+    await engine.load(modelId);
     return engine;
   }
 
-  if (modelId) await engine.load(modelId);
+  // The engine reports progress through its own lifecycle stream; WebLLM
+  // reports it through a callback. Forward only the load reports, so a
+  // caller's callback fires exactly when WebLLM's would have.
+  const stop = engine.subscribe((state) => {
+    if (state.progress) report(state.progress);
+  });
+  try {
+    await engine.load(modelId);
+  } finally {
+    stop();
+    report.done?.();
+  }
   return engine;
+}
+
+/**
+ * What you get when you say nothing: a throttled line on the console.
+ *
+ * Deliberately not the engine's own behaviour — `new ScheduledEngine()` stays
+ * silent, because a library core that logs is wrong inside a worker, an
+ * extension background page or a test. This is the getting-started facade, and
+ * the person calling it has not yet decided how to render anything.
+ *
+ * Throttled to one line a second, because WebLLM's callback fires per shard and
+ * a 58-shard model would otherwise bury the console. The 100% report is never
+ * dropped, so the last line always reads as finished rather than as 97%.
+ */
+function defaultProgressReporter(modelId) {
+  if (typeof console === "undefined") return null;
+
+  const startedAt = Date.now();
+  let announced = false;
+  let lastAt = 0;
+  let sawProgress = false;
+
+  const emit = ({ text, progress }) => {
+    sawProgress = true;
+    if (!announced) {
+      announced = true;
+      console.info(
+        `[everything-webgpu] loading ${modelId} — the first run downloads the weights and can take ` +
+          "minutes; later loads read the cache and need no network. " +
+          "Pass initProgressCallback to render this yourself, or null to silence it.",
+      );
+    }
+    const now = Date.now();
+    const finished = (progress ?? 0) >= 1;
+    if (!finished && now - lastAt < 1000) return;
+    lastAt = now;
+    const pct = `${Math.round((progress ?? 0) * 100)}%`.padStart(4);
+    console.info(`[everything-webgpu] ${pct}  ${text ?? ""}`.trimEnd());
+  };
+
+  // Called once when the load settles, so the common case ends on a line that
+  // says it worked rather than trailing off mid-progress.
+  emit.done = () => {
+    if (!sawProgress) return;
+    console.info(
+      `[everything-webgpu] ${modelId} ready in ${((Date.now() - startedAt) / 1000).toFixed(1)}s.`,
+    );
+  };
+  return emit;
 }
 
 /**

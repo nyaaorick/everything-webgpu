@@ -2,7 +2,7 @@
  * Engine pool + priority scheduler.
  *
  * Why this exists: the GPU gives us ~10 completion ticks per second, shared by
- * every caller (README, "The 10 tok/s ceiling"). Two consequences drive the
+ * every caller (AI.md, "The 10 tok/s ceiling"). Two consequences drive the
  * whole design:
  *
  *  - A single generation can never beat ~10 tok/s. When decode is *sync-bound*
@@ -33,7 +33,7 @@
  *
  * `createEngine` is injected so the scheduler can be tested without a GPU.
  */
-import { PRIORITY, PRIORITY_ORDER } from "./constants.js";
+import { JOB_KIND, PRIORITY, PRIORITY_ORDER } from "./constants.js";
 
 let nextJobId = 0;
 
@@ -141,6 +141,10 @@ export class EnginePool {
       session: spec.session,
       priority,
       preemptible: Boolean(spec.preemptible),
+      // What the slot's engine should be asked to do. Everything else about a
+      // job — priority, supersession, preemption, one-task-one-engine — is the
+      // same either way, which is why this is a field and not a second pool.
+      kind: spec.kind === JOB_KIND.EMBEDDING ? JOB_KIND.EMBEDDING : JOB_KIND.CHAT,
       params: spec.params,
       onChunk: spec.onChunk ?? (() => {}),
       text: "",
@@ -359,6 +363,18 @@ export class EnginePool {
 
     (async () => {
       try {
+        if (job.kind === JOB_KIND.EMBEDDING) {
+          // One shot, no stream: an embedding is a single forward pass and
+          // WebLLM returns the whole OpenAI-shaped response at once. There is
+          // no decode loop here, so none of the streaming bookkeeping applies —
+          // but the queueing, priority and preemption above all still did.
+          const res = await slot.engine.embeddings.create({ ...job.params });
+          job.usage = res.usage;
+          job.embeddings = res.data;
+          this.#finish(job, { cancelled: Boolean(job.cancelling && !job.preempting) });
+          return;
+        }
+
         const stream = await slot.engine.chat.completions.create({
           ...job.params,
           stream: true,
@@ -406,6 +422,7 @@ export class EnginePool {
       id: job.id,
       text: job.text,
       usage: job.usage,
+      ...(job.embeddings ? { embeddings: job.embeddings } : {}),
       ...(job.toolCalls ? { toolCalls: job.toolCalls } : {}),
       // Interrupted work reports "abort" whatever the stream last said.
       finishReason: extra.cancelled || extra.preempted ? "abort" : job.finishReason,

@@ -3,7 +3,7 @@
  *
  * Why this exists: decode here is not compute-bound, it is *sync*-bound. Firefox
  * resolves `onSubmittedWorkDone()` / `mapAsync()` only on a 100 ms poll tick
- * (README, "The 10 tok/s ceiling"), and stock WebLLM needs exactly one sync per
+ * (AI.md, "The 10 tok/s ceiling"), and stock WebLLM needs exactly one sync per
  * token — it reads the sampled token id back to JS before it can build the next
  * step's input. One token per tick = 9.6 tok/s, of which ~7 ms is real compute.
  *
@@ -37,6 +37,13 @@
  * trade vLLM makes. Anything needing per-token CPU feedback (grammar-constrained
  * JSON, logprobs, a logit processor) falls back to single-step, where behaviour
  * is identical to stock WebLLM.
+ *
+ * The other cost is that all of this drives ~30 undocumented tvmjs internals. A
+ * WebLLM upgrade that renames one does not break generation — it turns the fast
+ * path off and takes the throughput with it, silently. `PIPELINE_CONTRACT` below
+ * is that surface written down and checked against the live pipeline before the
+ * first burst, so the failure announces itself instead of being measured months
+ * later.
  */
 
 /** vLLM's documented sweet spot, and the value this extension ships. */
@@ -50,6 +57,95 @@ export const MAX_DECODE_STEPS = 32;
 
 export const clampSteps = (n) => Math.max(1, Math.min(MAX_DECODE_STEPS, Math.round(Number(n)) || 1));
 
+// -------------------------------------------------- the pipeline contract ----
+
+/**
+ * Every tvmjs pipeline internal a burst drives, and how each must behave.
+ *
+ * None of these are documented, none are part of WebLLM's public surface, and
+ * nothing upstream promises they will keep their names. The contract test checks
+ * them against the *bundle* on every `npm test`; this checks them against the
+ * *live object*, which is a different question — a member can survive in the
+ * bundle and still not be on the pipeline handed to us, if upstream moves it to
+ * a subclass, a different pipeline type, or behind a factory.
+ *
+ * Split three ways because presence alone is not the failure that hurts:
+ *
+ *  - **`calls`** must be callable. A rename here throws, which is the *good*
+ *    case — it is loud.
+ *  - **`numbers`** are read arithmetically or incremented in place. This is the
+ *    silent one: `pipeline.filledKVCacheLength += 1` on a member that no longer
+ *    exists creates a new property, nothing throws, and the KV cache accounting
+ *    quietly drifts. A missing `contextWindowSize` makes `burstSize` NaN.
+ *  - **`reads`** need only exist.
+ *
+ * `logitProcessor` is deliberately optional: `burstSize` tests it for
+ * `undefined`, so absent is the normal case, not a broken one.
+ *
+ * The list is not maintained by hand — `webllm-contract.test.mjs` derives the
+ * set this file actually reaches for from its own source and asserts it matches
+ * this declaration exactly, so adding a `pipeline.newThing` without declaring it
+ * fails the build.
+ */
+export const PIPELINE_CONTRACT = {
+  calls: [
+    "embed",
+    "fKVCacheBeginForward",
+    "fKVCacheEndForward",
+    "fapplyLogitBias",
+    "fapplyPenalty",
+    "fargsortProbs",
+    "fsampleWithTopP",
+    "fsoftmaxWithTemperature",
+    "getActiveKVStates",
+    "invokeDecode",
+    "processNextToken",
+    "resetChat",
+    "stopped",
+  ],
+  numbers: [
+    "contextWindowSize",
+    "curRoundDecodingTotalTime",
+    "curRoundDecodingTotalTokens",
+    "decodingTotalTime",
+    "decodingTotalTokens",
+    "filledKVCacheLength",
+    "fullVocabSize",
+    "slidingWindowSize",
+  ],
+  reads: [
+    "appearedTokensFreq",
+    "config",
+    "device",
+    "outputIds",
+    "params",
+    "sampleIndices",
+    "sampleIndicesDevice",
+    "topPDevice",
+    "tvm",
+  ],
+  optional: ["logitProcessor"],
+};
+
+/**
+ * What this pipeline is missing, as sentences a reader can act on.
+ * Empty means a burst is safe to run.
+ */
+export function missingPipelineMembers(pipeline) {
+  if (!pipeline || typeof pipeline !== "object") return ["the pipeline itself is not an object"];
+  const missing = [];
+  for (const name of PIPELINE_CONTRACT.calls) {
+    if (typeof pipeline[name] !== "function") missing.push(`${name}() is not a function`);
+  }
+  for (const name of PIPELINE_CONTRACT.numbers) {
+    if (typeof pipeline[name] !== "number") missing.push(`${name} is not a number`);
+  }
+  for (const name of PIPELINE_CONTRACT.reads) {
+    if (pipeline[name] === undefined) missing.push(`${name} is missing`);
+  }
+  return missing;
+}
+
 /**
  * Replaces `engine.decode` with a burst-and-drain version.
  *
@@ -61,10 +157,16 @@ export const clampSteps = (n) => Math.max(1, Math.min(MAX_DECODE_STEPS, Math.rou
  * @param {object} [options]
  * @param {number} [options.steps] forward steps per sync; 1 disables the path
  * @param {(info: {steps: number, tokens: number, ms: number}) => void} [options.onBurst]
- * @returns {{setSteps: (n: number) => void, readonly steps: number}}
+ * @param {(info: {missing: string[]}) => void} [options.onFallback] fired once
+ *   per pipeline that fails the contract, before it is routed to stock decoding
+ * @returns {{setSteps: (n: number) => void, readonly steps: number,
+ *            readonly fallbacks: number}}
  */
-export function installMultiStepDecoding(engine, { steps = DEFAULT_DECODE_STEPS, onBurst } = {}) {
-  const config = { steps: clampSteps(steps) };
+export function installMultiStepDecoding(
+  engine,
+  { steps = DEFAULT_DECODE_STEPS, onBurst, onFallback } = {},
+) {
+  const config = { steps: clampSteps(steps), fallbacks: 0 };
   const lookahead = new WeakMap();
   const baseDecode = engine.decode.bind(engine);
   const basePrefill = engine.prefill.bind(engine);
@@ -73,6 +175,43 @@ export function installMultiStepDecoding(engine, { steps = DEFAULT_DECODE_STEPS,
     let state = lookahead.get(pipeline);
     if (!state) lookahead.set(pipeline, (state = { queue: [] }));
     return state;
+  };
+
+  /** Contract verdict per pipeline; the check runs once, the answer is reused. */
+  const supported = new WeakMap();
+
+  /**
+   * Whether this pipeline may be burst, decided once and remembered.
+   *
+   * Checked at first decode rather than at install time because there is no
+   * pipeline yet when this function runs — the engine gets one per `reload()`,
+   * and hands it to us as an argument. So the guard lives at the first place a
+   * pipeline is ever seen.
+   *
+   * Failing here means an upgrade moved something and multi-step decoding is
+   * gone. Stock decoding still produces correct tokens, so the danger is not a
+   * crash but silence: ~18.4 -> ~9.7 tok/s with nothing in the log to explain
+   * it. Hence one loud report, and a `fallbacks` count the worker can surface.
+   */
+  const canBurst = (pipeline) => {
+    const known = supported.get(pipeline);
+    if (known !== undefined) return known;
+
+    const missing = missingPipelineMembers(pipeline);
+    supported.set(pipeline, missing.length === 0);
+    if (missing.length > 0) {
+      config.fallbacks += 1;
+      console.error(
+        "[everything-webgpu] multi-step decoding disabled — falling back to stock " +
+          "single-step decode. Generation stays correct, throughput roughly halves.\n" +
+          `  The pipeline is missing ${missing.length} of the internals a burst drives:\n` +
+          missing.map((line) => `    - ${line}`).join("\n") +
+          "\n  This is what a WebLLM upgrade looks like from here. `npm test` " +
+          "(webllm-contract) says whether the names are gone from the bundle too.",
+      );
+      onFallback?.({ missing });
+    }
+    return missing.length === 0;
   };
 
   // A round can end with tokens still buffered — a stop token mid-burst, or an
@@ -87,6 +226,11 @@ export function installMultiStepDecoding(engine, { steps = DEFAULT_DECODE_STEPS,
     const state = stateFor(pipeline);
 
     if (state.queue.length === 0) {
+      // Before the first burst on this pipeline, not before every one: the
+      // verdict is cached, so a healthy pipeline pays one property scan for the
+      // whole conversation.
+      if (!canBurst(pipeline)) return baseDecode(pipeline, genConfig);
+
       const burst = burstSize(pipeline, genConfig, config.steps);
       if (burst <= 1) return baseDecode(pipeline, genConfig);
 
@@ -115,6 +259,10 @@ export function installMultiStepDecoding(engine, { steps = DEFAULT_DECODE_STEPS,
     setSteps: (n) => void (config.steps = clampSteps(n)),
     get steps() {
       return config.steps;
+    },
+    /** Pipelines that failed the contract. Non-zero means the fast path is off. */
+    get fallbacks() {
+      return config.fallbacks;
     },
   };
 }

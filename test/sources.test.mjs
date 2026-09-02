@@ -159,6 +159,181 @@ test("registerModel takes a URL or files, and refuses both", async () => {
   );
 });
 
+// ------------------------------------------- load(), one polymorphic entry ---
+
+/**
+ * `load` absorbs `registerModel` and `ingestModelFolder`. The dispatch is what
+ * these test: a bare id must behave exactly as before (every test above still
+ * passes unchanged), and each other shape must reach the right primitive
+ * without the caller having had to pick it.
+ */
+const { classifySource, SOURCE_KIND, idFromUrl, nearMatches, looksLikeUrl } = await import(
+  "../src/engine/sources.js"
+);
+
+/**
+ * `<input webkitdirectory>` hands over a FileList, not an array.
+ *
+ * Deliberately array-like and **not** iterable. A real FileList is iterable, so
+ * this is the weaker contract — which is the one worth testing, because it is
+ * where spreading used to throw "fileList is not iterable" from three frames
+ * away from anything the caller wrote.
+ */
+const asFileList = (entries) => {
+  const list = { length: entries.length, item: (i) => entries[i].file };
+  entries.forEach((e, i) => {
+    // webkitRelativePath is how a real FileList carries the folder structure.
+    Object.defineProperty(e.file, "webkitRelativePath", { value: e.path, configurable: true });
+    list[i] = e.file;
+  });
+  return list;
+};
+
+/** A drop event hands over a DataTransfer with no entries API in this stub. */
+const asDataTransfer = (entries) => ({
+  items: entries.map(() => ({ kind: "file", webkitGetAsEntry: () => null })),
+  files: asFileList(entries),
+});
+
+test("classifySource tells the four shapes apart", () => {
+  assert.equal(classifySource("Some-Model-MLC").kind, SOURCE_KIND.ID);
+  assert.equal(
+    classifySource("https://cdn.example/m/", { modelLib: "https://cdn.example/m/l.wasm" }).kind,
+    SOURCE_KIND.REMOTE,
+  );
+  assert.equal(classifySource({ model: "/m/", modelLib: "/m/l.wasm" }).kind, SOURCE_KIND.REGISTER);
+  assert.equal(classifySource({ files: [] }).kind, SOURCE_KIND.FILES);
+  assert.equal(classifySource([{ path: "a", file: 1 }]).kind, SOURCE_KIND.FILES);
+
+  // A path-shaped string is a URL, not an id nobody registered. No prebuilt id
+  // contains `/` or `:`, so this can never steal a real one.
+  assert.ok(looksLikeUrl("/models/foo/") && looksLikeUrl("./m/") && looksLikeUrl("https://x/"));
+  assert.ok(!looksLikeUrl("Llama-3.2-1B-Instruct-q4f16_1-MLC"));
+});
+
+test("an id is derived from a URL, but a modelLib never is", () => {
+  assert.equal(idFromUrl("https://huggingface.co/mlc-ai/Foo-MLC"), "Foo-MLC");
+  assert.equal(idFromUrl("https://cdn.example/models/foo/"), "foo");
+  assert.equal(idFromUrl("/models/my-model/"), "my-model");
+
+  // The measured rule: guessing the lib is wrong 163 times out of 163, so the
+  // refusal has to happen here rather than as a 404 inside WebLLM's loader.
+  assert.throws(
+    () => classifySource("https://cdn.example/m/"),
+    /needs `modelLib`.*cannot be\s+guessed/s,
+  );
+});
+
+test("a URL loads through registration, with modelLib required", async () => {
+  const store = freshStore();
+  const { engine } = engineWith(store, { prebuilt: false });
+
+  await assert.rejects(
+    () => engine.load("https://cdn.example/Foo-MLC/"),
+    (err) => err.code === "BAD_REQUEST" && /cannot be\s+guessed/s.test(err.message),
+    "a URL without modelLib must fail before any fetch",
+  );
+
+  await assert.rejects(
+    () =>
+      engine.load("https://cdn.example/Foo-MLC/", {
+        modelLib: "https://raw.githubusercontent.com/x/Foo_cs1k-webgpu.wasm",
+      }),
+    new RegExp(REACHED_WEBLLM),
+    "with modelLib it registers and hands off",
+  );
+
+  const [record] = await store.list();
+  assert.equal(record.model_id, "Foo-MLC", "the id came from the URL's last segment");
+  assert.equal(record.model, "https://cdn.example/Foo-MLC/", "the URL is passed through untouched");
+});
+
+test("`/resolve/main/` is never derived — WebLLM's cleanModelUrl owns that", async () => {
+  // Deriving it here would re-introduce the duplication ARCHIVE.md records
+  // removing, and would double up on a URL that already carries it.
+  const store = freshStore();
+  const { engine } = engineWith(store, { prebuilt: false });
+  const url = "https://huggingface.co/mlc-ai/Bar-MLC";
+  await assert.rejects(
+    () => engine.load(url, { modelLib: "https://raw.githubusercontent.com/x/bar.wasm" }),
+    new RegExp(REACHED_WEBLLM),
+  );
+  const [record] = await store.list();
+  assert.equal(record.model, url);
+  assert.ok(!record.model.includes("/resolve/"), "we must not have appended it ourselves");
+});
+
+test("a folder loads in every shape a caller might hold it", async () => {
+  for (const [label, wrap] of [
+    ["entries", (e) => e],
+    ["{ files }", (e) => ({ files: e })],
+    ["FileList", asFileList],
+    ["DataTransfer", asDataTransfer],
+  ]) {
+    const store = freshStore();
+    const { engine } = engineWith(store, { prebuilt: false });
+    const id = `Folder-4B-q4f16_1-MLC`;
+    await assert.rejects(
+      () => engine.load(wrap(fakeModelFolder(id))),
+      new RegExp(REACHED_WEBLLM),
+      `${label} should ingest then hand off`,
+    );
+    const [record] = await store.list();
+    assert.equal(record.source, SOURCE.INJECTED, `${label} took the injected route`);
+    assert.equal(record.model_id, id);
+  }
+});
+
+test("defer registers without building a pool", async () => {
+  const store = freshStore();
+  const { engine, loads } = engineWith(store, { prebuilt: false });
+
+  const record = await engine.load(fakeModelFolder("Deferred-4B-q4f16_1-MLC"), { defer: true });
+  assert.equal(record.source, SOURCE.INJECTED);
+  assert.equal(record.model_id, "Deferred-4B-q4f16_1-MLC");
+  assert.equal(loads(), 0, "defer must not fetch the bundle or build an engine");
+  assert.equal(engine.state.status, "idle", "the engine is untouched");
+
+  // And the deferred model is loadable later by id — the drop-now-load-later flow.
+  await assert.rejects(() => engine.load("Deferred-4B-q4f16_1-MLC"), new RegExp(REACHED_WEBLLM));
+});
+
+test("defer on a bare id is an error, not a silent no-op", async () => {
+  const { engine } = engineWith(freshStore());
+  await assert.rejects(
+    () => engine.load("Llama-3.2-1B-Instruct-q4f16_1-MLC", { defer: true }),
+    /there is nothing to register/,
+  );
+});
+
+test("load refuses a source it cannot classify, and both-at-once", async () => {
+  const { engine } = engineWith(freshStore());
+  await assert.rejects(() => engine.load(), /needs a model id, a URL/);
+  await assert.rejects(() => engine.load(42), /did not recognise that source/);
+  await assert.rejects(
+    () => engine.load({ files: [], model: "/m/", modelLib: "/m/l.wasm" }),
+    /either `files`.*or `model`/s,
+  );
+});
+
+test("an unknown id suggests the ones it might have been", async () => {
+  // A typo is the likeliest way to reach this error, and the fix is usually
+  // already in the list being held.
+  assert.deepEqual(nearMatches("Llama-3.2-1B-Instruct-q4f16_1-MLC", ["Llama-3.2-1B-Instruct-q4f16_1-MLC"]), [
+    "Llama-3.2-1B-Instruct-q4f16_1-MLC",
+  ]);
+  assert.deepEqual(nearMatches("llama-3.2-1b", ["Llama-3.2-1B-Instruct-q4f16_1-MLC"]), [
+    "Llama-3.2-1B-Instruct-q4f16_1-MLC",
+  ]);
+  assert.deepEqual(nearMatches("totally-unrelated-xyz", ["Llama-3.2-1B-Instruct-q4f16_1-MLC"]), []);
+
+  const { engine } = engineWith(freshStore());
+  await assert.rejects(
+    () => engine.load("Llama-3.2-1B-Instruct-q4f16_1"),
+    /Did you mean "Llama-3\.2-1B-Instruct-q4f16_1-MLC"/,
+  );
+});
+
 test("a locally registered model has no URL that can reach the network", async () => {
   // The offline guarantee is structural, not a promise: every URL the record
   // carries — the base, the model lib, and every cache key — must be on a host

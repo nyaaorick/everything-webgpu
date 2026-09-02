@@ -133,6 +133,52 @@ test("unload frees VRAM and keeps the cache, so reloading needs no network", asy
   assert.deepEqual(engine.resident, [A]);
 });
 
+test("unload(id, 'cache') goes one level deeper, in one call", async () => {
+  // The two depths are the same intention — "I am done with this model" — so
+  // they are one verb with a level, not two verbs the caller has to choose
+  // between by knowing that VRAM and disk are different subsystems.
+  const store = freshStore();
+  const engine = engineWith(store);
+  const record = await ingestModelFolder(fakeModelFolder(A), { store });
+
+  await engine.load(A);
+  await engine.unload(A, "cache");
+
+  assert.deepEqual(engine.resident, [], "VRAM freed");
+  assert.equal(await engine.cacheState(A), "absent", "and the bytes with it");
+  assert.ok(await store.get(A), "but the model is still known — that is remove()'s job, not this one");
+  assert.equal(record.source, SOURCE.INJECTED);
+});
+
+test("a bare unload() frees the current model, never all of them", async () => {
+  // The decision recorded in ROADMAP §2b. The plan originally had a bare call
+  // unload *everything*, which would silently change what existing callers do.
+  const store = freshStore();
+  const engine = engineWith(store);
+  await ingestModelFolder(fakeModelFolder(A), { store });
+  await ingestModelFolder(fakeModelFolder(B), { store });
+
+  await engine.load(A);
+  await engine.load(B, { keepResident: true });
+  assert.deepEqual(engine.resident.sort(), [A, B].sort());
+
+  await engine.unload();
+  assert.deepEqual(engine.resident, [A], "only the current one went");
+
+  await engine.unloadAll();
+  assert.deepEqual(engine.resident, [], "unloadAll is the explicit form");
+});
+
+test("an unrecognised unload level is refused, and points at remove()", async () => {
+  // "forget this model" is the reading someone will try to spell as a level,
+  // and it is the one operation that cannot be undone — so the error names it.
+  const engine = engineWith(freshStore());
+  await assert.rejects(
+    () => engine.unload(A, "everything"),
+    (err) => err.code === "BAD_REQUEST" && /must be "vram" or "cache".*use remove\(\)/s.test(err.message),
+  );
+});
+
 test("evict frees the disk and remembers the model; remove forgets it", async () => {
   const store = freshStore();
   const engine = engineWith(store);

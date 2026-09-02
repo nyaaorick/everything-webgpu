@@ -1,0 +1,16 @@
+{
+  "name": "everything-webgpu-example-webext",
+  "private": true,
+  "type": "module",
+  "description": "A minimal MV2 WebExtension that runs the engine on its own extension page.",
+  "scripts": {
+    "build": "vite build",
+    "start": "npm run build && npx --yes web-ext@8 run --source-dir dist --pref dom.webgpu.enabled=true --pref gfx.webgpu.ignore-blocklist=true"
+  },
+  "dependencies": {
+    "everything-webgpu": "file:../.."
+  },
+  "devDependencies": {
+    "vite": "^6.0.0"
+  }
+}

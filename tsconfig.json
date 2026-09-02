@@ -21,7 +21,8 @@
   },
   "include": [
     "src/engine/**/*.js",
-    "src/adapters/**/*.js"
+    "src/adapters/**/*.js",
+    "src/vite.js"
   ],
   "exclude": [
     "src/engine/engine-worker.js",

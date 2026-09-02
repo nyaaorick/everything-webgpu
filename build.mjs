@@ -58,7 +58,7 @@ function applyPatches() {
   const manifest = existsSync(MANIFEST) ? JSON.parse(readFileSync(MANIFEST, "utf8")) : null;
   const bumped = manifest && manifest.webllmVersion !== installed;
 
-  const { ok, applicable, failures } = verifyPatches(source);
+  const { ok, applicable, failures, plan } = verifyPatches(source);
   const anchors = applicable.reduce((n, p) => n + p.edits.length, 0);
 
   if (bumped) {
@@ -83,10 +83,11 @@ function applyPatches() {
     );
   }
 
-  for (const patch of applicable) {
-    for (const edit of patch.edits) source = source.replace(edit.before, edit.after);
-    console.log(`applied ${patch.id}`);
-  }
+  // Splice at the verified offsets, back to front, so each rewrite lands exactly
+  // where verification found it — including the anchors that are unique only
+  // within an enclosing function, which a whole-file `replace` could not express.
+  for (const edit of plan) source = source.slice(0, edit.start) + edit.after + source.slice(edit.end);
+  for (const patch of applicable) console.log(`applied ${patch.id}`);
   writeFileSync(BUNDLE, source);
 
   writeFileSync(

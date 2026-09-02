@@ -23,18 +23,45 @@
  * rename of `requiredMaxStorageBuffersPerShaderStage` to
  * `…PerStage` is reported as an 85%-similar identifier with its line and source,
  * which was the difference between minutes and an afternoon.
+ *
+ * Two things widen what counts as a match, and it is worth being precise about
+ * what each one actually survives — the earlier plan overstated both.
+ *
+ *  - **Anchors match modulo whitespace.** An anchor is written as literal JS and
+ *    compiled to a pattern that tolerates reflowing: a line break inside
+ *    `submit([…])`, a space before `;`. It does **not** survive a rename, and
+ *    neither would an AST search by name — that is the same identifier either
+ *    way. Since we control minification (`--minify`, off) and the bundle's
+ *    formatting is upstream's published JS, this is the *less* likely drift; it
+ *    costs nothing, so it is on for every anchor.
+ *  - **An anchor can be scoped to an enclosing function** (`in`). This is the
+ *    one that pays. `compute.end();` is a generic string, and requiring it to be
+ *    unique in 6 MB means any unrelated new `compute.end();` anywhere in tvmjs
+ *    fails the build for no reason. Scoped to the function that contains the
+ *    `beginComputePass()` anchor, that whole class of false failure is gone —
+ *    and the scope is derived from a *matched anchor*, not a function name, so
+ *    it adds no new identifier that upstream could rename out from under us.
  */
+
+import { parse } from "acorn";
 
 /** Cap so one compute pass can never grow unbounded; 41/flush is the measured norm. */
 export const MAX_DISPATCHES_PER_PASS = 1024;
 
 /**
+ * @typedef {object} Edit
+ * @property {string} before literal JS, matched modulo whitespace. Must appear
+ *   exactly once in its search range — more than one match means the anchor
+ *   stopped being unique and the rewrite could land in the wrong place
+ * @property {string} after
+ * @property {{enclosing: number}} [in] restrict the search to the function
+ *   enclosing edit `enclosing`'s match, rather than the whole bundle
+ *
  * @typedef {object} Patch
  * @property {string} id
  * @property {string} why  one line, shown when the patch is skipped or fails
- * @property {Array<{before: string, after: string}>} edits each `before` must
- *   appear exactly once — more than one match means the anchor stopped being
- *   unique and the rewrite could land in the wrong place
+ * @property {() => boolean} [skipWhen]
+ * @property {Edit[]} edits
  */
 
 /** @type {Patch[]} */
@@ -71,8 +98,16 @@ export const PATCHES = [
           "const compute = this.pendingComputePass;",
       },
       // Do not end it per launch; only guard against an unbounded pass.
+      //
+      // Scoped to the shader-submit function the anchor above matched in.
+      // `compute.end();` is generic enough that requiring it to be unique across
+      // 6 MB makes the build hostage to unrelated tvmjs code: any new compute
+      // pass anywhere else in the runtime would fail it. Inside that one
+      // function it is unambiguous, which is the only place uniqueness is
+      // load-bearing.
       {
         before: "compute.end();",
+        in: { enclosing: 0 },
         after: `if (this.pendingDispatchCount >= ${MAX_DISPATCHES_PER_PASS}) this.flushCommands();`,
       },
       // Close it exactly where the encoder is submitted.
@@ -85,6 +120,114 @@ export const PATCHES = [
     ],
   },
 ];
+
+// ------------------------------------------------------------- matching ----
+
+const escape = (c) => c.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const isWord = (c) => /[\w$]/.test(c);
+
+/**
+ * Compile a literal-JS anchor into a whitespace-tolerant pattern.
+ *
+ * Between two word characters whitespace is significant — `const x` cannot
+ * become `constx` — so a gap there stays required. Everywhere a punctuation
+ * character is involved, whitespace becomes optional in both directions, which
+ * is what makes `submit([this.pendingEncoder.finish()]);` survive being reflowed
+ * across three lines, or `= 10;` survive `= 10 ;`.
+ *
+ * The ends are word-bounded, for the reason the contract test's member check
+ * was: a plain substring search for `compute.end();` also matches
+ * `precompute.end();`, and a second "match" that is not one fails the build just
+ * as hard as a real ambiguity.
+ */
+export function anchorPattern(anchor) {
+  const chars = [...anchor.trim()];
+  let out = isWord(chars[0]) ? "(?<![\\w$])" : "";
+  for (let i = 0; i < chars.length; i++) {
+    out += escape(chars[i]);
+    let j = i + 1;
+    while (j < chars.length && /\s/.test(chars[j])) j += 1;
+    if (j >= chars.length) break;
+    const gap = j > i + 1;
+    if (isWord(chars[i]) && isWord(chars[j])) out += gap ? "\\s+" : "";
+    else out += "\\s*";
+    i = j - 1;
+  }
+  return isWord(chars.at(-1)) ? `${out}(?![\\w$])` : out;
+}
+
+/** Every match of a compiled anchor that lies wholly inside `[from, to)`. */
+function matchesIn(pattern, source, from = 0, to = source.length) {
+  const re = new RegExp(pattern, "g");
+  re.lastIndex = from;
+  const found = [];
+  for (let m = re.exec(source); m; m = re.exec(source)) {
+    if (m.index >= to) break;
+    if (m.index + m[0].length <= to) found.push({ start: m.index, end: m.index + m[0].length });
+    re.lastIndex = m.index + Math.max(1, m[0].length);
+  }
+  return found;
+}
+
+// -------------------------------------------------------------- scoping ----
+
+const FUNCTIONS = new Set([
+  "FunctionDeclaration",
+  "FunctionExpression",
+  "ArrowFunctionExpression",
+]);
+
+/** Parsing 6 MB costs ~1 s, and a build asks for at most one scope per edit. */
+let parsed = { source: null, ast: null };
+
+function ast(source) {
+  if (parsed.source !== source) {
+    parsed = { source, ast: parse(source, { ecmaVersion: "latest", sourceType: "module" }) };
+  }
+  return parsed.ast;
+}
+
+/** The name the nearest enclosing binding gives a function, for reporting. */
+function nameOf(node) {
+  if (node.type === "FunctionDeclaration" || node.type === "ClassDeclaration") return node.id?.name;
+  if (node.type === "VariableDeclarator") return node.id?.name;
+  if (node.type === "MethodDefinition" || node.type === "Property") {
+    return node.key?.name ?? node.key?.value;
+  }
+  return undefined;
+}
+
+/**
+ * The innermost function containing `offset`.
+ *
+ * A generic descent rather than `acorn-walk`: the only question is containment,
+ * and pruning on it makes the walk proportional to nesting depth instead of to
+ * the size of the file.
+ */
+function enclosingFunction(source, offset) {
+  let best = null;
+  let bestName;
+  const visit = (node, name) => {
+    if (node.start > offset || node.end <= offset) return;
+    const named = nameOf(node) ?? name;
+    if (FUNCTIONS.has(node.type)) {
+      best = node;
+      bestName = named;
+    }
+    for (const key of Object.keys(node)) {
+      const value = node[key];
+      if (Array.isArray(value)) {
+        for (const child of value) if (child?.type) visit(child, named);
+      } else if (value?.type) {
+        visit(value, named);
+      }
+    }
+  };
+  visit(ast(source), undefined);
+  return best && { start: best.start, end: best.end, name: bestName ?? "(anonymous)" };
+}
+
+const lineOf = (source, offset) => source.slice(0, offset).split("\n").length;
 
 /** Words that carry no locating power; `const` matches half the file. */
 const NOISE = new Set(
@@ -173,29 +316,72 @@ function locate(anchor, source, limit = 3) {
 }
 
 /**
- * Checks every anchor of every applicable patch without writing anything.
- * @returns {{ok: boolean, applicable: Patch[], failures: Array<object>}}
+ * Checks every anchor of every applicable patch without writing anything, and
+ * returns where each one matched.
+ *
+ * The offsets are the point: the caller rewrites by splicing them, so an anchor
+ * is located exactly once and the text that gets replaced is the text that was
+ * verified. (It also means a `$&` in a replacement is inert, which
+ * `String.replace` would have expanded.)
+ *
+ * @returns {{ok: boolean, applicable: Patch[], failures: Array<object>,
+ *            plan: Array<{patch: string, start: number, end: number, after: string}>}}
  */
 export function verifyPatches(source) {
   const applicable = PATCHES.filter((p) => !p.skipWhen?.());
   const failures = [];
+  const plan = [];
 
   for (const patch of applicable) {
+    /** Resolved matches by edit index, so a later edit can scope to an earlier one. */
+    const resolved = [];
+
     for (const [index, edit] of patch.edits.entries()) {
-      const matches = source.split(edit.before).length - 1;
-      if (matches !== 1) {
-        failures.push({
-          patch: patch.id,
-          why: patch.why,
-          index,
-          anchor: edit.before,
-          matches,
-          candidates: matches === 0 ? locate(edit.before, source) : null,
-        });
+      const fail = (extra) =>
+        failures.push({ patch: patch.id, why: patch.why, index, anchor: edit.before, ...extra });
+
+      let scope = null;
+      if (edit.in) {
+        const host = resolved[edit.in.enclosing];
+        if (!host) {
+          // Its scope comes from an anchor that did not match. Reporting this as
+          // a second missing anchor would send the reader looking for two
+          // problems; there is one.
+          fail({ matches: null, blockedBy: edit.in.enclosing });
+          continue;
+        }
+        scope = enclosingFunction(source, host.start);
+        if (!scope) {
+          fail({ matches: null, noScope: true });
+          continue;
+        }
       }
+
+      const found = matchesIn(
+        anchorPattern(edit.before),
+        source,
+        scope?.start ?? 0,
+        scope?.end ?? source.length,
+      );
+      if (found.length !== 1) {
+        fail({
+          matches: found.length,
+          scope: scope && { ...scope, line: lineOf(source, scope.start) },
+          // Only search the whole file for where it went; a scoped miss is far
+          // more likely to be the scope having moved than the anchor's words
+          // having vanished, and the global view shows both.
+          candidates: found.length === 0 ? locate(edit.before, source) : null,
+        });
+        continue;
+      }
+      resolved[index] = found[0];
+      plan.push({ patch: patch.id, start: found[0].start, end: found[0].end, after: edit.after });
     }
   }
-  return { ok: failures.length === 0, applicable, failures };
+
+  // Descending, so splicing one edit cannot invalidate the offsets of the next.
+  plan.sort((a, b) => b.start - a.start);
+  return { ok: failures.length === 0, applicable, failures, plan };
 }
 
 /** Human-readable report for a failed verification. */
@@ -203,7 +389,26 @@ export function explainFailures(failures) {
   const out = [];
   for (const f of failures) {
     out.push("");
-    out.push(`  ✗ ${f.patch} [anchor ${f.index + 1}] — ${f.matches} matches, expected exactly 1`);
+    if (f.blockedBy !== undefined) {
+      out.push(`  ✗ ${f.patch} [anchor ${f.index + 1}] — not checked`);
+      out.push(`    looking for: ${f.anchor}`);
+      out.push(
+        `    it is scoped to the function anchor ${f.blockedBy + 1} matched in, and that anchor`,
+      );
+      out.push("    did not match. Fix that one first; this may well follow it.");
+      continue;
+    }
+    if (f.noScope) {
+      out.push(`  ✗ ${f.patch} [anchor ${f.index + 1}] — scope not found`);
+      out.push(`    looking for: ${f.anchor}`);
+      out.push("    the anchor it scopes to now matches at top level, not inside a function.");
+      out.push("    Upstream restructured this area; re-read it before re-anchoring.");
+      continue;
+    }
+    const where = f.scope ? ` in ${f.scope.name}() (line ${f.scope.line})` : "";
+    out.push(
+      `  ✗ ${f.patch} [anchor ${f.index + 1}] — ${f.matches} matches${where}, expected exactly 1`,
+    );
     out.push(`    looking for: ${f.anchor}`);
     if (f.matches > 1) {
       // Not a missing anchor but an ambiguous one. Rewriting on any of them

@@ -21,9 +21,11 @@ the developer hosts, or a local folder read off disk with no network connection 
 
 | | |
 | --- | --- |
+| [README.md](README.md) | The developer-facing entry point. Asserted by [test/readme.test.mjs](test/readme.test.mjs), so its examples cannot drift from the API. |
+| [API.md](API.md) | Every call form, one page. Asserted by [test/api-doc.test.mjs](test/api-doc.test.mjs) — method names, error codes, enum values and the export list are all derived from the source. |
 | [ROADMAP.md](ROADMAP.md) | **The only list of open work.** |
 | [ARCHIVE.md](ARCHIVE.md) | What was done and *why* — decisions with their reasoning, so they are not re-litigated. |
-| [WEBLLM-SURFACE.md](WEBLLM-SURFACE.md) | What WebLLM already does. **Read before adding a capability.** |
+| [WEBLLM-SURFACE.md](WEBLLM-SURFACE.md) | What WebLLM already does. **Read before adding a capability**, and follow its "Upgrading" runbook on every dependency bump. |
 | This file | What is true and measured. Reference, not a plan. |
 
 Task lists used to live here, in AI2.md and in NATIVE-REUSE-PLAN.md at the same time, with "Track 1"
@@ -62,7 +64,7 @@ sources, the WebLLM de-duplication — is in [ARCHIVE.md](ARCHIVE.md) with its r
   UI + extension-to-extension API provider. See [ARCHIVE.md](ARCHIVE.md).
 - **Model**: `Qwen3.8-2B-q4f16_1` (1.06 GB), compiled in-house from `empero-ai/Qwen3.8-2B-Distill` — see [MLC-COMPILE.md](MLC-COMPILE.md). `Qwen3.5-0.8B-q4f16_1-MLC` remains the baseline most of the analysis below was measured on. Keep `q4f16_1` — dequantisation measured ~free, so wider formats only add bytes, and bytes are what decode pays for.
 - **Scheduling**: one shared GPU, one engine per task, pool grows on demand. A second engine measured 1.06x on this model, so it buys isolation rather than throughput.
-- **Build-time patches** ([build.mjs](build.mjs)): `patchStorageBufferLimit` (Firefox caps storage buffers per stage at 9, tvmjs asks for 10) and `patchComputePassBatching` (one compute pass per kernel launch -> one per flush). Both fail the build loudly if their anchors stop matching after a WebLLM upgrade; `NO_PASS_MERGE=1` skips the second for A/B.
+- **Build-time patches** ([build/patches.mjs](build/patches.mjs), applied by [build.mjs](build.mjs)): `storage-buffer-limit` (Firefox caps storage buffers per stage at 9, tvmjs asks for 10) and `compute-pass-batching` (one compute pass per kernel launch -> one per flush). Anchors are literal JS matched modulo whitespace, word-bounded, and optionally scoped to an enclosing function; all are verified before anything is rewritten, so a WebLLM bump reports every break at once with the nearest candidate lines. `npm run verify-patches` checks them without rebuilding; `NO_PASS_MERGE=1` skips the second patch for A/B.
 
 ---
 
@@ -83,6 +85,7 @@ Compiled in-house; see [MLC-COMPILE.md](MLC-COMPILE.md).
 | Re-prefill cost per history token | 5.27 ms (no cross-turn KV reuse — see Current Tasks) |
 | Kernel launches per decoded token | 664 = 639 forward + 25 sampling, across ~16 flushes |
 | Second engine, 4-prompt batch | **1.06x** — see "Scheduling" |
+| Two tasks on two engines (e2e) | 1.05x, then **1.11x and 1.12x** on two later runs. The ratio held across runs whose absolute times differed by 35%, so it is a real shift rather than noise — but 1.11x is still isolation, not throughput scaling. |
 
 ### The baseline it was built against: `Qwen3.5-0.8B-q4f16_1` (443 MB, 11 shards)
 
@@ -97,7 +100,7 @@ architecture came from — the ceiling, the multi-step fix and the pass-batching
 | Prefill | 95-98 tok/s |
 | Decode, stock single-step | 9.6 tok/s (warm) |
 | Decode, multi-step K=15, one pass per kernel | 17.3-18.3 tok/s |
-| Decode, multi-step K=15 + batched compute passes | **25.9 tok/s** |
+| Decode, multi-step K=15 + batched compute passes | **24.9-28.0 tok/s** (25.9 when first measured; 27.4, 28.0, 24.9 across later e2e runs on the same build — run-to-run spread is ~12%, so treat any single number as ±1.5) |
 | Decode, K=32 + batched passes | 26.8 tok/s |
 | Kernel launches per decoded token | 664, across ~16 flushes |
 | Decode budget at K=16 | 3.8 ms CPU encode + ~34 ms GPU + <6 ms tick |
@@ -240,11 +243,12 @@ not buying correctness.
 
 ### Batching the compute passes
 
-`patchComputePassBatching()` in [build.mjs](build.mjs) rewrites tvmjs to open a pass lazily and close it in
-`flushCommands()` — already the one chokepoint every operation that cannot run mid-pass routes through. That
-turns 664 passes/token into ~16. Three exact-string edits, each refusing to apply if its anchor stops
-matching after a WebLLM upgrade, same as the storage-buffer shim next to it. Build with `NO_PASS_MERGE=1` to
-skip it and A/B on one machine.
+The `compute-pass-batching` patch in [build/patches.mjs](build/patches.mjs) rewrites tvmjs to open a pass
+lazily and close it in `flushCommands()` — already the one chokepoint every operation that cannot run
+mid-pass routes through. That turns 664 passes/token into ~16. Three edits, each refusing to apply if its
+anchor stops matching after a WebLLM upgrade, same as the storage-buffer shim next to it. The `compute.end();`
+anchor is scoped to the function the pass is opened in, so an unrelated compute pass elsewhere in tvmjs is not
+mistaken for ambiguity. Build with `NO_PASS_MERGE=1` to skip it and A/B on one machine.
 
 Measured on the same 127-token greedy generation (`temperature: 0`, single engine, K=15):
 
@@ -866,13 +870,17 @@ with extension ids to restrict access.
 | [src/engine/index.js](src/engine/index.js) | Public entry point of the library |
 | [src/engine/create.js](src/engine/create.js) | `CreateScheduledEngine` — the one-line swap for `CreateMLCEngine` |
 | [src/engine/chat.js](src/engine/chat.js) | `chat.completions.create()`, the WebLLM/OpenAI facade |
-| [src/engine/errors.js](src/engine/errors.js) | `EngineError` and the seven codes |
+| [src/engine/environment.js](src/engine/environment.js) | `environment()` — the read-only device/runtime report; writes are `configure()` |
+| [src/engine/errors.js](src/engine/errors.js) | `EngineError` and the eight codes |
 | [src/engine/device.js](src/engine/device.js) | Hardware probe, `canRun`, model ranking |
 | [src/engine/engine.js](src/engine/engine.js) | `ScheduledEngine` — the engine with no transport attached |
 | [src/engine/pool.js](src/engine/pool.js) | Engine pool + priority scheduler |
 | [src/engine/engine-worker.js](src/engine/engine-worker.js) | One pool slot's engine, in its own realm |
 | [src/engine/multistep.js](src/engine/multistep.js) | Multi-step decoding: K forward steps per GPU sync |
+| [src/engine/sources.js](src/engine/sources.js) | What `load()` was handed — pure dispatch across id / URL / spec / folder |
 | [src/engine/ingest.js](src/engine/ingest.js) | Folder validation and cache injection |
+| [src/engine/recipes.js](src/engine/recipes.js) | `ask()` / `conversation()` / `ghostText()` — the three shapes as one call each, scheduling only |
+| [src/engine/prefetch.js](src/engine/prefetch.js) | `prefetch()` — fill the cache with no engine and no GPU; WebLLM's `hasModelInCache` is the oracle |
 | [src/engine/model-store.js](src/engine/model-store.js) | Cache layout, registry, settings, `StorageAdapter`, the three model sources |
 | [src/engine/constants.js](src/engine/constants.js) | `PRIORITY`, `ENGINE_STATE` — engine vocabulary, transport-free |
 | [src/adapters/protocol.js](src/adapters/protocol.js) | Wire protocol: `PROTOCOL`, `OP`, `PORT_OP` |
@@ -893,7 +901,7 @@ with extension ids to restrict access.
 | [test/e2e/bench.mjs](test/e2e/bench.mjs) | Standalone WebGPU sync-latency benchmark (`npm run bench`) |
 | [MLC-COMPILE.md](MLC-COMPILE.md) | How the model was compiled, and every toolchain breakage on the way |
 | [tools/](tools/) | Model-compilation toolchain: setup, nightly patches, weight strip, wasm audits |
-| [WEBLLM-SURFACE.md](WEBLLM-SURFACE.md) | What WebLLM already does, what we add, and where the line is. **Read before adding a capability.** |
+| [WEBLLM-SURFACE.md](WEBLLM-SURFACE.md) | What WebLLM already does, what we add, and where the line is. **Read before adding a capability**; its "Upgrading" section is the dependency-bump runbook. |
 | [ROADMAP.md](ROADMAP.md) | The only list of open work |
 | [ARCHIVE.md](ARCHIVE.md) | What was done and why — the extraction, the model sources, the de-duplication |
 

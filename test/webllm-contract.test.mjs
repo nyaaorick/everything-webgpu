@@ -25,6 +25,9 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
+import { PIPELINE_CONTRACT } from "../src/engine/multistep.js";
+import { resolveModelUrl } from "../src/engine/prefetch.js";
+
 const bundle = readFileSync(new URL("../vendor/web-llm.js", import.meta.url), "utf8");
 const webllm = await import("../vendor/web-llm.js");
 const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
@@ -166,16 +169,63 @@ test("the storage-buffer shim was applied to this bundle", () => {
 
 // ------------------------------------------- the monkeypatched internals ----
 
+/**
+ * Every pipeline member `multistep.js` reaches for, read out of its own source.
+ *
+ * Deriving beats maintaining a list by hand — but only if the derivation sees
+ * everything. It did not: `\bpipeline\.` misses a member reached across a line
+ * break, and `pipeline\n  .fsoftmaxWithTemperature(...)` is exactly that, so the
+ * softmax at the heart of the burst had no rename guard at all for as long as
+ * this test has existed. Tolerating whitespace is the same fix the build's patch
+ * anchors needed, for the same reason.
+ */
+function membersReached() {
+  const source = readFileSync(new URL("../src/engine/multistep.js", import.meta.url), "utf8")
+    // Comments are stripped first. Without this a member merely *named* in prose
+    // becomes a member the bundle must contain — the same false failure the
+    // build's over-broad anchors had, arriving from the opposite direction.
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/^\s*\/\/.*$/gm, "");
+  const dotted = [...source.matchAll(/\bpipeline\s*\.\s*([A-Za-z_$][\w$]*)/g)].map((m) => m[1]);
+  // `const { tvm, device } = pipeline` never appears as `pipeline.tvm`, and the
+  // burst cannot run without either.
+  const destructured = [...source.matchAll(/const\s*\{([^}]*)\}\s*=\s*pipeline\b/g)]
+    .flatMap((m) => m[1].split(","))
+    .map((name) => name.trim())
+    .filter(Boolean);
+  return new Set([...dotted, ...destructured]);
+}
+
+test("the declared pipeline contract is exactly what multistep.js reaches for", () => {
+  // `PIPELINE_CONTRACT` is what the *runtime* guard checks against a live
+  // pipeline. A hand-written list that quietly falls behind the code would make
+  // that guard pass while the thing it guards is broken, so the two are pinned
+  // to each other here rather than trusted to stay in step.
+  const declared = new Set([
+    ...PIPELINE_CONTRACT.calls,
+    ...PIPELINE_CONTRACT.numbers,
+    ...PIPELINE_CONTRACT.reads,
+    ...PIPELINE_CONTRACT.optional,
+  ]);
+  const reached = membersReached();
+
+  const undeclared = [...reached].filter((name) => !declared.has(name)).sort();
+  assert.deepEqual(undeclared, [], "multistep.js reaches for members the contract does not declare");
+
+  const stale = [...declared].filter((name) => !reached.has(name)).sort();
+  assert.deepEqual(stale, [], "the contract declares members multistep.js no longer uses");
+});
+
 test("every tvmjs internal multistep.js reaches into still exists", () => {
   // The list is *derived from our own source*, so it cannot drift out of date
   // the way a hand-maintained one would.
   //
   // These are undocumented pipeline members. A rename does not throw — it makes
   // multi-step decoding silently stop working, taking 9.7 -> 18.4 tok/s with it
-  // and leaving no error to notice. This is the cheapest possible guard; the
+  // and leaving no error to notice. This is the cheapest static guard; the
+  // runtime one is `missingPipelineMembers` against the live pipeline, and the
   // behavioural one is `npm run e2e`'s decode probe.
-  const source = readFileSync(new URL("../src/engine/multistep.js", import.meta.url), "utf8");
-  const members = new Set([...source.matchAll(/\bpipeline\.([a-zA-Z_$][\w$]*)/g)].map((m) => m[1]));
+  const members = membersReached();
 
   assert.ok(members.size > 20, `expected multistep to touch many internals, found ${members.size}`);
 
@@ -189,6 +239,31 @@ test("every tvmjs internal multistep.js reaches into still exists", () => {
     [],
     `multistep.js reaches for pipeline members that no longer exist in WebLLM: ${missing.join(", ")}`,
   );
+});
+
+test("our mirrored cleanModelUrl still agrees with WebLLM's, character for character", () => {
+  // `prefetch.js` writes the cache keys WebLLM's loader will look for, so its
+  // `resolveModelUrl` must derive URLs identically to the bundle's own
+  // `cleanModelUrl`. A divergence is not a crash — it is a cache written where
+  // nothing reads it, and a user downloading the model twice.
+  //
+  // Rather than eyeball the two, the bundle's version is pulled out and *run*.
+  const source = bundle.match(/function cleanModelUrl\(modelUrl\) \{[\s\S]*?\n\}/)?.[0];
+  assert.ok(source, "cleanModelUrl is gone from the bundle — prefetch's key derivation is unanchored");
+
+  // eslint-disable-next-line no-new-func
+  const theirs = new Function(`${source}; return cleanModelUrl;`)();
+
+  for (const input of [
+    "https://huggingface.co/mlc-ai/Llama-3.2-1B-Instruct-q4f16_1-MLC",
+    "https://huggingface.co/mlc-ai/Foo-MLC/",
+    "https://huggingface.co/mlc-ai/Foo/resolve/main/",
+    "https://huggingface.co/org/Foo/resolve/v2/",
+    "https://cdn.example/models/foo/",
+    "https://cdn.example/models/foo",
+  ]) {
+    assert.equal(resolveModelUrl(input), theirs(input), `derivation differs for ${input}`);
+  }
 });
 
 test("every engine method the pool and worker drive still exists", () => {

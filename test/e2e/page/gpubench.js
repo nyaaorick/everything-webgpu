@@ -626,14 +626,122 @@ export async function gpuBench({ iters = 40 } = {}) {
     dispatchSweep[`dispatch${n}UsEach`] = +((ms / n) * 1000).toFixed(2);
   }
 
+  // ---- pass sweep, on a device of its own --------------------------------
+  //
+  // This is the probe that kills the device: 2048 compute passes in one encoder
+  // loses it outright, and a lost device does not throw — every later call
+  // quietly no-ops. Two things followed from sharing the main device with it.
+  //
+  // The first was that everything after this point was suspect. That turned out
+  // to be nothing, because the sweep was already last — but "trustworthy only
+  // because nothing runs after it" is a property that breaks the moment someone
+  // adds a probe below.
+  //
+  // The second is the real one: the sweep corrupts *its own* numbers. The run
+  // that prompted this reported `perPass=-3.9us` — 512 passes measured faster
+  // than one, i.e. negative time per pass, which is the device dying mid-sweep
+  // and the remaining submits becoming free.
+  //
+  // A sacrificial device was the first fix, and it half worked: the sweep's own
+  // numbers became honest (`n512` went from `perPass=-3.9us` to ~10us, `n2048`
+  // said `discarded`), but the *main* device still died. A runaway command
+  // buffer on Metal resets the whole adapter, not one device on it, so
+  // isolation bought trustworthy numbers and no containment at all.
+  //
+  // The second fix removes the cause rather than the blast radius. **The limit
+  // is passes per encoder, not passes per measurement**: 512 in one encoder is
+  // proven fine, 2048 is not. So the passes are split across encoders of at
+  // most 512 and handed to a *single* `queue.submit([...])`.
+  //
+  // What makes that still a valid measurement is that both arms are chunked
+  // identically — same encoder count, same submit count, same total passes —
+  // so the difference between them remains pure per-pass overhead, which is the
+  // only quantity this probe exists to produce.
+  //
+  // The sacrificial device stays. It is nearly free, and if a future driver
+  // dies somewhere else in here it should not take the run's other numbers.
   phase = "pass-sweep";
   const passSweep = {};
-  for (const n of [512, 2048]) {
-    const inOnePass = await timePasses(n, true);
-    const inNPasses = await timePasses(n, false);
-    passSweep[`n${n}`] =
-      `1pass=${inOnePass.toFixed(0)}ms ${n}passes=${inNPasses.toFixed(0)}ms ` +
-      `perPass=${(((inNPasses - inOnePass) / n) * 1000).toFixed(1)}us`;
+  let sweepDeviceLost = false;
+  try {
+    const sweepDevice = await adapter.requestDevice();
+    sweepDevice.lost.then(() => (sweepDeviceLost = true));
+    const sweepBuf = sweepDevice.createBuffer({
+      size: 4096,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+    });
+    const sweepPipeline = sweepDevice.createComputePipeline({
+      layout: "auto",
+      compute: { module: sweepDevice.createShaderModule({ code: WGSL }), entryPoint: "main" },
+    });
+    const sweepBind = sweepDevice.createBindGroup({
+      layout: sweepPipeline.getBindGroupLayout(0),
+      entries: [{ binding: 0, resource: { buffer: sweepBuf } }],
+    });
+
+    /**
+     * Passes per *encoder*. 512 completes cleanly on this driver; 2048 in one
+     * encoder is what loses the device. Both arms use the same chunking, so the
+     * split cancels out of the difference between them.
+     */
+    const MAX_PASSES_PER_ENCODER = 512;
+
+    const sweepPasses = async (n, onePass) => {
+      const chunks = Math.ceil(n / MAX_PASSES_PER_ENCODER);
+      const t0 = performance.now();
+      const buffers = [];
+      let remaining = n;
+      for (let c = 0; c < chunks; c++) {
+        const count = Math.min(MAX_PASSES_PER_ENCODER, remaining);
+        remaining -= count;
+        const enc = sweepDevice.createCommandEncoder();
+        if (onePass) {
+          const pass = enc.beginComputePass();
+          pass.setPipeline(sweepPipeline);
+          pass.setBindGroup(0, sweepBind);
+          for (let i = 0; i < count; i++) pass.dispatchWorkgroups(1);
+          pass.end();
+        } else {
+          for (let i = 0; i < count; i++) {
+            const pass = enc.beginComputePass();
+            pass.setPipeline(sweepPipeline);
+            pass.setBindGroup(0, sweepBind);
+            pass.dispatchWorkgroups(1);
+            pass.end();
+          }
+        }
+        buffers.push(enc.finish());
+      }
+      // One submit regardless of how many encoders it took, so submit overhead
+      // is identical across arms and across values of n.
+      sweepDevice.queue.submit(buffers);
+      await sweepDevice.queue.onSubmittedWorkDone();
+      return performance.now() - t0;
+    };
+
+    for (const n of [512, 2048]) {
+      if (sweepDeviceLost) {
+        passSweep[`n${n}`] = "skipped (sweep device already lost)";
+        continue;
+      }
+      const inOnePass = await sweepPasses(n, true);
+      const inNPasses = await sweepPasses(n, false);
+      const perPass = ((inNPasses - inOnePass) / n) * 1000;
+      // A negative per-pass cost is not a fast GPU, it is a dead one. Report the
+      // fact rather than a number that will be read as a measurement.
+      passSweep[`n${n}`] = sweepDeviceLost
+        ? `discarded (device lost during the ${n}-pass encode)`
+        : perPass < 0
+          ? `discarded (perPass=${perPass.toFixed(1)}us — negative, device likely lost)`
+          : `1pass=${inOnePass.toFixed(0)}ms ${n}passes=${inNPasses.toFixed(0)}ms ` +
+            `perPass=${perPass.toFixed(1)}us` +
+            // Named, because "2048 passes" now means 4 encoders rather than 1 and
+            // a reader comparing against an older run should see why.
+            (n > MAX_PASSES_PER_ENCODER ? ` (${Math.ceil(n / MAX_PASSES_PER_ENCODER)} encoders, 1 submit)` : "");
+    }
+    if (!sweepDeviceLost) sweepDevice.destroy();
+  } catch (err) {
+    passSweep.n512 = `unavailable: ${String(err?.message ?? err).slice(0, 120)}`;
   }
 
   device.destroy();
@@ -666,7 +774,11 @@ export async function gpuBench({ iters = 40 } = {}) {
     // Cost of a dispatch *inside* a pass, swept past the tick so it is a real
     // measurement rather than an upper bound imposed by the poll grid.
     ...dispatchSweep,
+    // The main device. The pass-sweep now runs on its own, so this no longer
+    // reports "yes, during pass-sweep" for a loss that was expected and
+    // contained — a loss here means a probe that was supposed to be safe wasn't.
     deviceLostDuringBench: deviceLost ? `yes, during ${lostDuring}` : false,
+    passSweepDeviceLost: sweepDeviceLost,
     streamBufferMB: STREAM_MB,
     streamByLoadWidth: Object.entries(widthProbe).map(([k, v]) => `${k}=${v}`).join(" "),
     streamByWorkgroups: Object.entries(occupancy).map(([k, v]) => `${k}=${v}`).join(" "),

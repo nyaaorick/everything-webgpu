@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>everything-webgpu — bare page</title>
+    <style>
+      :root { color-scheme: light dark; font: 15px/1.5 system-ui, sans-serif; }
+      body { margin: 0; padding: 2rem; max-width: 46rem; }
+      h1 { font-size: 1.1rem; margin: 0 0 0.25rem; }
+      p.sub { margin: 0 0 1.5rem; opacity: 0.7; }
+      .bar { height: 4px; background: color-mix(in srgb, currentColor 15%, transparent); border-radius: 2px; overflow: hidden; margin: 0.75rem 0; }
+      .bar > i { display: block; height: 100%; width: 0; background: currentColor; transition: width 0.2s; }
+      #status { font: 13px ui-monospace, monospace; opacity: 0.8; min-height: 1.5em; white-space: pre-wrap; }
+      form { display: flex; gap: 0.5rem; margin: 1rem 0; }
+      input[type="text"] { flex: 1; padding: 0.5rem 0.6rem; font: inherit; }
+      button { padding: 0.5rem 1rem; font: inherit; }
+      button:disabled { opacity: 0.5; }
+      #out { white-space: pre-wrap; padding: 0.75rem; border: 1px solid color-mix(in srgb, currentColor 20%, transparent); border-radius: 6px; min-height: 3em; }
+      .meta { display: block; margin-top: 0.5rem; font: 12px ui-monospace, monospace; opacity: 0.6; }
+    </style>
+  </head>
+  <body>
+    <h1>everything-webgpu — bare page</h1>
+    <p class="sub">
+      Vanilla Vite. Imports <code>everything-webgpu</code> through its
+      <code>exports</code> map, loads a prebuilt model from HuggingFace, and streams a reply.
+    </p>
+
+    <button id="load">Load Llama-3.2-1B-Instruct</button>
+    <div class="bar"><i id="progress"></i></div>
+    <div id="status">Idle.</div>
+
+    <form id="ask" hidden>
+      <input id="prompt" type="text" value="Name three primary colours." autocomplete="off" />
+      <button id="send" type="submit">Send</button>
+    </form>
+    <div id="out" hidden></div>
+
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>

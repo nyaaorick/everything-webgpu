@@ -102,7 +102,7 @@ async function renderPoolCost() {
  *
  * Firefox resolves a GPU sync only on a 100 ms tick, so a burst of K steps costs
  * a whole number of ticks. The reference figure is the ~7.3 ms/token of real
- * compute measured for a 0.8B (README, "The 10 tok/s ceiling"); a bigger model
+ * compute measured for a 0.8B (AI.md, "The 10 tok/s ceiling"); a bigger model
  * costs more per step and wants a smaller K.
  */
 const TICK_MS = 100;

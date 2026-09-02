@@ -5,12 +5,14 @@
   "scripts": {
     "build": "node build.mjs",
     "check": "node build.mjs --check-entries",
-    "test": "node --test test/webllm-contract.test.mjs test/integration.test.mjs test/scheduler.test.mjs test/multistep.test.mjs test/sources.test.mjs test/errors.test.mjs test/chat.test.mjs test/device.test.mjs test/manage.test.mjs",
+    "test": "node --test test/webllm-contract.test.mjs test/patches.test.mjs test/readme.test.mjs test/api-doc.test.mjs test/examples.test.mjs test/integration.test.mjs test/scheduler.test.mjs test/multistep.test.mjs test/environment.test.mjs test/sources.test.mjs test/prefetch.test.mjs test/embed.test.mjs test/recipes.test.mjs test/errors.test.mjs test/chat.test.mjs test/device.test.mjs test/manage.test.mjs",
     "package": "npm run build && node build.mjs --zip",
     "e2e": "node test/e2e/run.mjs",
+    "verify-consumer": "node test/consumer/verify.mjs",
     "bench": "node test/e2e/bench.mjs",
     "types": "tsc -p tsconfig.json",
-    "prepublishOnly": "npm run build && npm run types && npm test",
+    "prepare": "node build.mjs",
+    "prepublishOnly": "npm run types && npm test",
     "contract": "node --test test/webllm-contract.test.mjs",
     "verify-patches": "node build.mjs --verify-patches"
   },
@@ -20,11 +22,11 @@
     "@mlc-ai/web-llm": "0.2.84"
   },
   "devDependencies": {
+    "acorn": "^8.18.0",
     "esbuild": "^0.28.2",
     "typescript": "^5.9.2"
   },
   "type": "module",
-  "private": true,
   "types": "types/engine/index.d.ts",
   "exports": {
     ".": {
@@ -32,6 +34,10 @@
       "default": "./src/engine/index.js"
     },
     "./worker": "./src/engine/engine-worker.js",
+    "./vite": {
+      "types": "./types/vite.d.ts",
+      "default": "./src/vite.js"
+    },
     "./adapters/idb": {
       "types": "./types/adapters/idb.d.ts",
       "default": "./src/adapters/idb.js"
@@ -52,6 +58,7 @@
   "files": [
     "src/engine",
     "src/adapters",
+    "src/vite.js",
     "types",
     "vendor"
   ]

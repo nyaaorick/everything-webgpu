@@ -197,7 +197,92 @@ run and passed — but it is the exact threshold `probeDevice()`'s `NO_KV_REUSE`
 future run reporting the same value is worth cross-checking against `device.test.mjs`'s assumptions
 rather than assumed benign a second time.
 
+> **[resolved] A second run reported 9 again, and the cross-check says 9 is the baseline, not an
+> anomaly.** AI.md has said so all along — the Firefox Metal backend caps
+> `maxStorageBuffersPerShaderStage` at 9, which is the entire reason the `storage-buffer-limit`
+> patch exists. What the cross-check *did* surface is sharper than the original worry:
+> `device.test.mjs` defines a healthy device as `storageBuffers = 10`, so the "good" default in the
+> test matrix describes hardware nobody here has. On the reference M4, `probe.kvReuse` is
+> **always** `false`, `engine-worker.js` forces `resetChat()` on every prefill, and
+> **`batch_prefill_paged_kv_kernel` has therefore never executed on real hardware** — it is
+> mock-tested only. It would first run on a >=10-buffer device, i.e. Chrome (ROADMAP, Gate B).
+>
+> That also made the e2e's own multiround check misleading: with reuse forced off, its "with KV
+> reuse" and "forced reprefill" branches both ran the ragged kernel, so `identical` was guaranteed
+> and the line `paged prefill is fine` claimed something the run had not tested. The check now
+> reports `UNVERIFIED for paged prefill` on a sub-10-buffer device and still fails if two ragged
+> re-prefills of the same history disagree.
+
 The manifest.json restore left a diff — `restore()` round-trips the file through
 `JSON.parse`/`stringify`, which turns `\uXXXX`-escaped em-dashes back into literal UTF-8. Cosmetic,
 not a behaviour change, reverted with `git checkout`. Worth knowing before the next e2e run leaves the
 same diff and it looks like something broke.
+
+> **[fixed]** It did leave the same diff on the next run. The snapshot now only round-trips through
+> JSON when the tree is *actually* dirty (a run killed mid-flight leaves the patch behind); a clean
+> file is restored byte-for-byte. The cost of the old behaviour was not untidiness — it was training
+> the reader to ignore a dirty tree after an e2e, which is precisely when a real diff matters.
+
+
+## Lossless WebLLM upgrade — a bump is minutes, not an afternoon
+
+`@mlc-ai/web-llm` is pinned exactly because `build.mjs` rewrites the bundle by matching source text.
+"Lossless" was never meant as "automatic" — it means a bump *fails at the right line* instead of
+somewhere deep in a half-patched loader. The standing runbook is in
+[WEBLLM-SURFACE.md](WEBLLM-SURFACE.md), "Upgrading"; this is why each piece exists.
+
+Three guards, because there are three distinct ways an upgrade breaks us:
+
+| drift | caught by | the failure it prevents |
+| --- | --- | --- |
+| **surface** — code moved or reformatted | `build/patches.mjs` verify-then-write | a patch anchor silently landing in the wrong place, or the build half-applying and reporting only the first miss |
+| **semantic** — a symbol survives, its meaning changed | `test/webllm-contract.test.mjs` | an export deleted, a field renamed, an enum gaining a case — none of which throw |
+| **behavioural** — every name and shape intact, output wrong | `npm run e2e` | a tvmjs refactor that changes numerics |
+
+**Contract tests (2a).** Makes WEBLLM-SURFACE.md executable — every export and shape the project
+depends on, asserted statically against the bundle, GPU-free, first in `npm test`. The
+highest-value piece: it catches semantic drift, which the patches cannot see. Two guards beyond the
+obvious list: the monkeypatch member list is *derived from `multistep.js`'s own source* so it cannot
+go stale, and `model_lib` unguessability is asserted rather than assumed (if it became derivable,
+the "do not guess" rule in the verb-consolidation section should be revisited). Each assertion class
+was mutation-tested — which found a real bug: `bundle.includes(name)` still passes when
+`processNextToken` becomes `processNextTokenV2`, since the old name stays a substring. Now
+word-bounded.
+
+**Patch self-check and fuzzy diagnostics (2b).** Patches moved to `build/patches.mjs` as data,
+applied by a shared verifier. Every anchor is checked before anything is rewritten. `patch-manifest.json`
+records the version the anchors last held against, so a bump announces `0.2.84 -> 0.2.85: verifying
+4 anchor(s)` rather than silently succeeding. Vanished identifiers are matched against survivors by
+trigram overlap — simulated upstream renaming `requiredMaxStorageBuffersPerShaderStage`, the
+diagnostic found the replacement at 85% similarity with its line. Ambiguity is a hard stop too: an
+anchor matching 1995 sites refuses rather than rewriting one at random. Two corrections the
+simulation forced: rank candidate lines by summed *rarity* not hit count (raw count returned
+`const msg = {` — true and useless), and a rename needs a human to *approve* the new anchor, not to
+*find* it.
+
+**Structured patches (2c).** The corrected expectation held: AST parsing survives *formatting*
+drift, not renames — an AST search by name fails exactly as a string match does. So the gain is
+narrower than "structured = durable", and the work matched the correction rather than the original
+proposal. `in: { enclosing }` scopes an anchor to the function a *sibling anchor* matched in — a
+matched anchor, not a function name, so it adds no identifier upstream could rename. This removes the
+false-failure class around `compute.end();`, a string generic enough that any unrelated new compute
+pass in tvmjs failed the build. Anchors also match modulo whitespace and are word-bounded — the
+latter not in the plan and found the same way 2a's bug was: `compute.end();` is a substring of
+`precompute.end();`. The rebuilt bundle is byte-identical to the string-replacing applier's output.
+`acorn` is a devDependency, ~565 KB unpacked (the original estimate was off 10x), never shipped.
+
+**Runtime monkeypatch guard (2d).** `multistep.js` drives ~30 undocumented tvmjs internals; a rename
+turns the fast path off *silently* — ~18 -> ~10 tok/s with nothing in the log. 2a covers the static
+half. The runtime half: `PIPELINE_CONTRACT` + `missingPipelineMembers()`, checked against the live
+pipeline at first decode (there is no pipeline at install time — the engine gets one per `reload()`),
+verdict cached. Three buckets, because presence is not the failure that hurts: `calls` must be
+callable (a rename throws — loud), `numbers` must be numbers (`x += 1` on an absent member creates a
+property and the KV accounting drifts — silent), `reads` need only exist. Failure is loud once per
+pipeline and posts `multiStepOff` to the host, which is otherwise indistinguishable from an idle
+engine since `onBurst` is the only thing that reports stats. Found while building it: 2a's derivation
+matched `\bpipeline\.` and missed members reached across a line break — the softmax at the heart of
+the burst had no rename guard for as long as that test existed. Now whitespace-tolerant, comments
+stripped first, and `PIPELINE_CONTRACT` is asserted to equal what the source actually reaches for.
+
+**The flow, documented (2e).** Moved to WEBLLM-SURFACE.md so the doc you must revise on a bump is
+the doc that tells you how.

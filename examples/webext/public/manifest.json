@@ -1,0 +1,26 @@
+{
+  "manifest_version": 2,
+  "name": "everything-webgpu example",
+  "version": "0.1.0",
+  "description": "Minimal WebExtension that runs a local MLC model on WebGPU through everything-webgpu.",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "example@everything-webgpu",
+      "strict_min_version": "115.0"
+    }
+  },
+  "background": {
+    "scripts": ["background.js"],
+    "persistent": true
+  },
+  "browser_action": {
+    "default_title": "Open the everything-webgpu demo"
+  },
+  "permissions": [
+    "storage",
+    "unlimitedStorage",
+    "https://huggingface.co/*",
+    "https://raw.githubusercontent.com/*"
+  ],
+  "content_security_policy": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self';"
+}

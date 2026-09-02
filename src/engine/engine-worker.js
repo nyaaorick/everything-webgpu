@@ -33,7 +33,7 @@ import { DEFAULT_DECODE_STEPS, installMultiStepDecoding } from "./multistep.js";
 const handler = new WebWorkerMLCEngineHandler();
 
 /**
- * Running totals for the decode probe (README, "Where the 85 ms goes").
+ * Running totals for the decode probe (AI.md, "Where the 46 ms goes").
  *
  * `encodeMs` is content-process CPU — command encoding, `createBindGroup`, IPC.
  * `syncMs` is GPU execution plus the wait for Firefox's 100 ms poll tick. They
@@ -51,6 +51,17 @@ const stats = {
 };
 const resetStats = () => Object.keys(stats).forEach((k) => (stats[k] = 0));
 
+/**
+ * Set when a pipeline fails the multi-step contract, and never cleared — a
+ * retune resets the measurement window, not the fact that the fast path is off.
+ */
+let multiStepOff = null;
+
+// No `kind` field: WebLLM's client handler ignores messages it cannot classify
+// instead of throwing UnknownMessageKindError.
+const postStats = () =>
+  postMessage({ ewgpuStats: { ...stats, steps: multiStep.steps, multiStepOff } });
+
 const multiStep = installMultiStepDecoding(handler.engine, {
   steps: DEFAULT_DECODE_STEPS,
   onBurst: (b) => {
@@ -61,9 +72,14 @@ const multiStep = installMultiStepDecoding(handler.engine, {
     stats.dispatches += b.dispatches ?? 0;
     stats.forwardDispatches += b.forwardDispatches ?? 0;
     stats.flushes += b.flushes ?? 0;
-    // No `kind` field: WebLLM's client handler ignores messages it cannot
-    // classify instead of throwing UnknownMessageKindError.
-    postMessage({ ewgpuStats: { ...stats, steps: multiStep.steps } });
+    postStats();
+  },
+  // The only message that can ever report this. When the fast path is off there
+  // are no bursts, so `onBurst` never fires and the decode probe simply stops
+  // arriving — indistinguishable, from the host's side, from an idle engine.
+  onFallback: ({ missing }) => {
+    multiStepOff = missing;
+    postStats();
   },
 });
 
@@ -119,7 +135,7 @@ self.onmessage = (msg) => {
     // Every retune starts a fresh measurement window, so a sweep's points never
     // bleed into each other.
     resetStats();
-    postMessage({ ewgpuStats: { ...stats, steps: multiStep.steps } });
+    postStats();
     return;
   }
   handler.onmessage(msg);

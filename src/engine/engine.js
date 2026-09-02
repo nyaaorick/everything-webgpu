@@ -30,14 +30,18 @@
  * see `model-store.js`. Pass `prebuilt: false` for a build that must never
  * reach the network for a model.
  */
-import { ENGINE_STATE, PRIORITY, WORKER_CONFIGURE } from "./constants.js";
+import { ENGINE_STATE, JOB_KIND, PRIORITY, UNLOAD_LEVEL, WORKER_CONFIGURE } from "./constants.js";
 import { chatFacade } from "./chat.js";
+import { environmentFacade } from "./environment.js";
 import { canRun, probeDevice, projectSpeed, rankModels } from "./device.js";
 import { ERROR, EngineError, asEngineError } from "./errors.js";
-import { ingestModelFolder } from "./ingest.js";
+import { filesFromDataTransfer, filesFromInput, ingestModelFolder } from "./ingest.js";
 import { ModelStore, SOURCE, groupKeysByScope, isInjected, toAppConfig } from "./model-store.js";
 import { clampSteps } from "./multistep.js";
 import { EnginePool } from "./pool.js";
+import { prefetchModel } from "./prefetch.js";
+import { ask, conversation, ghostText } from "./recipes.js";
+import { SOURCE_KIND, classifySource, isDataTransfer, isFileList, nearMatches } from "./sources.js";
 
 /**
  * @typedef {object} CompletionRequest
@@ -73,12 +77,44 @@ import { EnginePool } from "./pool.js";
 const DEFAULT_WORKER_URL = () => new URL("./engine-worker.js", import.meta.url);
 const DEFAULT_LOAD_WEBLLM = () => import("../../vendor/web-llm.js");
 
+/**
+ * Turn "the package is not wired into your build" into a sentence that says so.
+ *
+ * `vendor/web-llm.js` is a **build product**, not a checked-in file, so the two
+ * ways to arrive here are both install-shaped rather than runtime-shaped: a git
+ * dependency whose `prepare` never ran, or a source checkout where `npm run
+ * build` was never run. Left alone this surfaced as a bare
+ * `Cannot find module '.../vendor/web-llm.js'` under the code
+ * `GENERATION_FAILED` — wrong twice over, since nothing had begun generating
+ * and the path named is ours, not the caller's.
+ */
+async function loadBundle(loadWebLLM) {
+  try {
+    return await loadWebLLM();
+  } catch (err) {
+    const message = String(err?.message ?? err);
+    // Only a resolution failure means "not built". A bundle that throws while
+    // *evaluating* is a real crash and must keep its own stack.
+    if (!/Cannot find module|Failed to (fetch|resolve)|ERR_MODULE_NOT_FOUND|dynamically imported module/i.test(message)) {
+      throw err;
+    }
+    throw new EngineError(
+      ERROR.PACKAGE_INCOMPLETE,
+      "everything-webgpu is installed but its WebLLM bundle (vendor/web-llm.js) is missing. " +
+        "That file is generated, not checked in — run `npm run build` in the package, " +
+        "or reinstall so its `prepare` script runs.",
+      { cause: "vendor-bundle-missing", underlying: message },
+    );
+  }
+}
+
 export class ScheduledEngine {
   #store;
   #workerUrl;
   #loadWebLLM;
   #prebuilt;
   #chat = null;
+  #environment = null;
   #probe = null;
   /** This machine's achieved decode bandwidth, learned from the first generation. */
   #decodeBytesPerSecond = 0;
@@ -134,7 +170,11 @@ export class ScheduledEngine {
     }
     this.#store = store instanceof ModelStore ? store : new ModelStore(store);
     this.#workerUrl = workerUrl ?? DEFAULT_WORKER_URL();
-    this.#loadWebLLM = loadWebLLM ?? DEFAULT_LOAD_WEBLLM;
+    // Wrapped once here rather than at each of the seven `#loadWebLLM()` call
+    // sites: a missing bundle is the same failure whichever verb reached it
+    // first, and a site added later gets the good error for free.
+    const load = loadWebLLM ?? DEFAULT_LOAD_WEBLLM;
+    this.#loadWebLLM = () => loadBundle(load);
     this.#prebuilt = prebuilt;
   }
 
@@ -152,6 +192,17 @@ export class ScheduledEngine {
   get chat() {
     this.#chat ??= chatFacade(this);
     return this.#chat;
+  }
+
+  /**
+   * `environment()` — the read-only report, with `environment.measure()` on it.
+   *
+   * Cached like `chat` so a caller can hold on to it. Writes are `configure()`;
+   * see `environment.js` for why those are separate verbs.
+   */
+  get environment() {
+    this.#environment ??= environmentFacade(this);
+    return this.#environment;
   }
 
   get state() {
@@ -319,6 +370,80 @@ export class ScheduledEngine {
   }
 
   /**
+   * Download a model into the cache **without building an engine**.
+   *
+   * For warming during onboarding: the bytes land while the user is still
+   * reading, and the later `load()` is a cache read. WebLLM cannot express this
+   * — `reload()` instantiates the wasm and needs a GPU before it fetches a
+   * single shard — so this is ours. See `prefetch.js` for the URL-derivation
+   * risk and the oracle that closes it.
+   *
+   * Needs no WebGPU at all, which is the other half of the point: an app can
+   * warm the cache on a machine it has not yet decided can run the model.
+   *
+   * @param {string} modelId
+   * @param {{signal?: AbortSignal, onProgress?: Function}} [opts]
+   */
+  async prefetch(modelId, { signal, onProgress } = {}) {
+    // Before anything, including the already-cached shortcut: a caller who
+    // aborted wants an abort, not a success they have to inspect to distrust.
+    if (signal?.aborted) {
+      throw new EngineError(ERROR.ABORTED, `Prefetch of "${modelId}" was aborted before it began.`, {
+        modelId,
+      });
+    }
+    const record = await this.#store.get(modelId);
+
+    // An injected model's bytes were written before it was ever registered;
+    // there is no URL to fetch from and nothing to do.
+    if (isInjected(record)) {
+      const { ok } = await this.#store.verify(record);
+      if (ok) return { modelId, files: 0, bytes: 0, alreadyCached: true };
+      throw new EngineError(
+        ERROR.CACHE_INCOMPLETE,
+        `"${modelId}" was injected from a folder, so it cannot be re-fetched. Re-register the folder.`,
+        { modelId },
+      );
+    }
+
+    const appConfig = await this.#appConfig();
+    const entry = appConfig.model_list.find((m) => m.model_id === modelId);
+    if (!entry) {
+      const near = nearMatches(modelId, appConfig.model_list.map((m) => m.model_id));
+      throw new EngineError(
+        ERROR.UNKNOWN_MODEL,
+        `Cannot prefetch "${modelId}": it is neither registered nor prebuilt. ` +
+          (near.length ? `Did you mean ${near.map((id) => `"${id}"`).join(", ")}? ` : ""),
+        { modelId, ...(near.length ? { near } : {}) },
+      );
+    }
+
+    const { hasModelInCache } = await this.#loadWebLLM();
+    if (await hasModelInCache(modelId, appConfig).catch(() => false)) {
+      return { modelId, files: 0, bytes: 0, alreadyCached: true };
+    }
+
+    const result = await prefetchModel({ modelId, record: entry, signal, onProgress });
+
+    // The oracle. `hasModelInCache` derives its keys through the very function
+    // `prefetch.js` mirrors, so this is the one check that can tell a correct
+    // prefetch from one that wrote a cache the loader will never read. Without
+    // it, a wrong key looks exactly like success and costs the user a second
+    // download of the whole model.
+    if (!(await hasModelInCache(modelId, appConfig).catch(() => false))) {
+      throw new EngineError(
+        ERROR.GENERATION_FAILED,
+        `Prefetch of "${modelId}" wrote ${result.files} artifacts, but WebLLM still reports the ` +
+          "model as uncached — the derived cache keys do not match the ones its loader looks for. " +
+          "Treat the cache as cold; load() will re-download. This is what a change to WebLLM's " +
+          "URL scheme looks like from here.",
+        { modelId, files: result.files },
+      );
+    }
+    return result;
+  }
+
+  /**
    * Free a model's bytes and **keep the registry entry**, so it stays a model
    * this engine knows how to get again — the distinction from
    * `store.remove()`, which forgets the URL a remote model would need.
@@ -328,6 +453,17 @@ export class ScheduledEngine {
    */
   async evict(modelId) {
     if (this.#pools.has(modelId)) await this.unload(modelId);
+    return this.#evictBytes(modelId);
+  }
+
+  /**
+   * The byte-freeing half of `evict()`, with no pool handling.
+   *
+   * Split out so `unload(id, "cache")` can reach it without going back through
+   * `evict()` → `unload()`, which would re-enter this class for a pool that has
+   * just been torn down.
+   */
+  async #evictBytes(modelId) {
     const record = await this.#store.get(modelId);
     if (isInjected(record)) return this.#store.evictInjected(modelId);
 
@@ -481,14 +617,83 @@ export class ScheduledEngine {
   }
 
   /**
-   * Bring a model up and make it current.
+   * Bring a model up, whatever form you have it in.
    *
-   * Additive by default: a model already resident stays resident, so switching
+   * One entry point for all three routes, because from a caller's side "load a
+   * model" is one intention and having to know which of `load`,
+   * `registerModel` and `ingestModelFolder` to reach for is a decision the
+   * library can make for them:
+   *
+   * ```js
+   * load("Llama-3.2-1B-Instruct-q4f16_1-MLC")            // prebuilt or registered id
+   * load("https://huggingface.co/mlc-ai/Foo", { modelLib })  // a URL you host
+   * load({ model, modelLib })                            // the same, explicit
+   * load({ files }) | load(fileList) | load(dataTransfer) // a folder, no network
+   * ```
+   *
+   * `registerModel` and `ingestModelFolder` remain, unchanged, as the low-level
+   * primitives — this composes them rather than replacing them.
+   *
+   * **A URL always needs `modelLib`.** It is not guessed; see `sources.js` for
+   * the measurement behind that. **`defer: true`** registers the source and
+   * stops there, returning the record instead of the state — the manager's
+   * drop-now-load-later flow.
+   *
+   * Additive residency: a model already resident stays resident, so switching
    * back to it costs nothing. That is only safe while the weights fit, so
    * `keepResident: false` (the default) unloads whatever else is up first —
    * the old single-model behaviour, and the safe one on a 16 GB machine.
    * Pass `keepResident: true` to hold both, having checked the budget yourself
    * with `canRun()`.
+   *
+   * @param {string | object} src an id, a URL, `{model, modelLib}`, or a folder
+   * @param {{keepResident?: boolean, signal?: AbortSignal, defer?: boolean,
+   *   id?: string, modelLib?: string, modelType?: string, contextWindow?: number,
+   *   vramRequiredMB?: number, onProgress?: Function}} [opts]
+   * @returns {Promise<object>} the engine state, or the registry record when `defer`
+   */
+  async load(src, opts = {}) {
+    const source = classifySource(src, opts);
+
+    if (source.kind === SOURCE_KIND.ID) {
+      if (opts.defer) {
+        throw new EngineError(
+          ERROR.BAD_REQUEST,
+          `\`defer\` registers a source without loading it, but "${source.modelId}" is an id — ` +
+            "there is nothing to register. Drop `defer`, or pass a URL or a folder.",
+          { modelId: source.modelId },
+        );
+      }
+      return this.#loadById(source.modelId, opts);
+    }
+
+    const record = await this.#register(source, opts);
+    if (opts.defer) return record;
+    return this.#loadById(record.model_id, opts);
+  }
+
+  /** Turns a classified non-id source into a registry record. */
+  async #register(source, opts) {
+    if (source.kind === SOURCE_KIND.FILES) {
+      return ingestModelFolder(await toEntries(source.files), {
+        store: this.#store,
+        modelId: source.modelId,
+        modelType: opts.modelType,
+        onProgress: opts.onProgress,
+      });
+    }
+    return this.#store.registerModel({
+      modelId: source.modelId,
+      model: source.model,
+      modelLib: source.modelLib,
+      modelType: opts.modelType,
+      contextWindow: opts.contextWindow,
+      vramRequiredMB: opts.vramRequiredMB,
+    });
+  }
+
+  /**
+   * Bring a registered or prebuilt id up and make it current.
    *
    * Cancellation is WebLLM's, not ours: `unload()` aborts the `reloadController`
    * whose signal it threads through every artifact fetch. And resume is free —
@@ -499,7 +704,7 @@ export class ScheduledEngine {
    * @param {string} modelId
    * @param {{keepResident?: boolean, signal?: AbortSignal}} [opts]
    */
-  async load(modelId, { keepResident = false, signal } = {}) {
+  async #loadById(modelId, { keepResident = false, signal } = {}) {
     if (signal?.aborted) {
       throw new EngineError(ERROR.ABORTED, `Load of "${modelId}" was aborted before it began.`, {
         modelId,
@@ -534,11 +739,13 @@ export class ScheduledEngine {
       }
 
       if (!registered && !this.#prebuilt) {
+        const near = nearMatches(modelId, models.map((m) => m.model_id));
         throw new EngineError(
           ERROR.UNKNOWN_MODEL,
           `Model "${modelId}" is not registered, and prebuilt models are disabled. ` +
-            `Call registerModel({ modelId, model, modelLib }) or registerModel({ modelId, files }) first.`,
-          { modelId, prebuilt: false },
+            (near.length ? `Did you mean ${near.map((id) => `"${id}"`).join(", ")}? ` : "") +
+            `Call load(url, { modelLib }) or load({ files }) first.`,
+          { modelId, prebuilt: false, ...(near.length ? { near } : {}) },
         );
       }
 
@@ -561,11 +768,17 @@ export class ScheduledEngine {
       const appConfig = toAppConfig(models, this.#prebuilt ? prebuiltAppConfig : null);
 
       if (!appConfig.model_list.some((m) => m.model_id === modelId)) {
+        // A typo'd id is the single most likely way to arrive here, and the
+        // fix is almost always visible in the list we are already holding.
+        const near = nearMatches(modelId, appConfig.model_list.map((m) => m.model_id));
         throw new EngineError(
           ERROR.UNKNOWN_MODEL,
           `Model "${modelId}" is neither registered nor in WebLLM's prebuilt list. ` +
+            (near.length
+              ? `Did you mean ${near.map((id) => `"${id}"`).join(", ")}? `
+              : "") +
             `Use listAvailableModels() to see what this engine can load.`,
-          { modelId },
+          { modelId, ...(near.length ? { near } : {}) },
         );
       }
 
@@ -577,13 +790,38 @@ export class ScheduledEngine {
           worker.addEventListener("message", (event) => {
             if (event.data?.ewgpuStats) this.#setState({ decode: event.data.ewgpuStats });
           });
+          // A worker whose script 404s does not throw from `new Worker()` — it
+          // fires one `error` event and is then simply silent, so WebLLM's
+          // handshake below never resolves and the load hangs until the caller
+          // gives up. That is the exact shape of the Vite dep-optimizer bug this
+          // names: esbuild copies `new URL("./engine-worker.js",
+          // import.meta.url)` into `.vite/deps/` verbatim, where the sibling
+          // file does not exist. Racing the handshake against this turns a hang
+          // into a sentence.
+          const workerFailed = new Promise((_, reject) => {
+            worker.addEventListener("error", (event) => {
+              reject(
+                new EngineError(
+                  ERROR.PACKAGE_INCOMPLETE,
+                  `The decode worker failed to load from ${this.#workerUrl}. ` +
+                    "If you are on Vite, its dependency pre-bundler rewrote the worker URL to a " +
+                    "path that does not exist — add `optimizeDeps: { exclude: [\"everything-webgpu\"] }` " +
+                    "to vite.config.js, or pass `workerUrl` yourself.",
+                  { cause: "worker-unreachable", workerUrl: String(this.#workerUrl), underlying: event.message },
+                ),
+              );
+            });
+          });
           // Sent before WebLLM's own handshake so the first token already decodes
           // multi-step; worker message order guarantees it arrives first.
           worker.postMessage({ kind: WORKER_CONFIGURE, decodeSteps });
-          const engine = await CreateWebWorkerMLCEngine(worker, modelId, {
-            appConfig,
-            initProgressCallback: onProgress,
-          });
+          const engine = await Promise.race([
+            CreateWebWorkerMLCEngine(worker, modelId, {
+              appConfig,
+              initProgressCallback: onProgress,
+            }),
+            workerFailed,
+          ]);
           // The worker owns the decode loop, so runtime knobs go straight to it
           // rather than through WebLLM's request path.
           engine.configure = (patch) => worker.postMessage({ kind: WORKER_CONFIGURE, ...patch });
@@ -653,15 +891,39 @@ export class ScheduledEngine {
   }
 
   /**
-   * Free a model's VRAM. **The cached bytes stay on disk**, so loading it again
-   * costs no network — that is the difference between this and
-   * `store.evict()`/`store.remove()`, and it is what makes switching back cheap.
+   * Let a model go, at one of two depths.
+   *
+   * ```js
+   * unload()               // the current model's VRAM; cached bytes stay
+   * unload(id)             // that model's VRAM
+   * unload(id, "cache")    // and delete its cached bytes, keeping the registry entry
+   * ```
+   *
+   * At `"vram"` the bytes stay on disk, so loading it again costs no network —
+   * that is what makes switching back cheap, and the difference between this
+   * and `remove()`.
+   *
+   * **A bare `unload()` frees only the current model**, not every resident one.
+   * `unloadAll()` is the explicit form for that: freeing everything is the more
+   * destructive of the two readings and should have to be asked for by name.
    *
    * @param {string} [modelId] defaults to the current model. Omit both this and
    *   any resident model to no-op.
+   * @param {"vram"|"cache"} [level]
    */
-  async unload(modelId = this.#current) {
-    if (modelId) await this.#unloadOne(modelId);
+  async unload(modelId = this.#current, level = UNLOAD_LEVEL.VRAM) {
+    if (!Object.values(UNLOAD_LEVEL).includes(level)) {
+      throw new EngineError(
+        ERROR.BAD_REQUEST,
+        `unload() level must be ${Object.values(UNLOAD_LEVEL).map((l) => `"${l}"`).join(" or ")}, ` +
+          `not "${level}". To forget the model entirely, use remove().`,
+        { level },
+      );
+    }
+    if (modelId) {
+      await this.#unloadOne(modelId);
+      if (level === UNLOAD_LEVEL.CACHE) await this.#evictBytes(modelId);
+    }
     this.#setState({
       status: this.#pools.size ? ENGINE_STATE.READY : ENGINE_STATE.IDLE,
       progress: null,
@@ -809,6 +1071,118 @@ export class ScheduledEngine {
     };
   }
 
+  // ------------------------------------------- the three shapes, as verbs ---
+  //
+  // `complete()` expresses all three. These exist because the scheduling is the
+  // part that is easy to get wrong and invisible when you do — see recipes.js.
+
+  /**
+   * One question, one answer, nothing kept.
+   *
+   * ```js
+   * const answer = await engine.ask("Summarise this in one line:\n" + doc);
+   * ```
+   *
+   * @param {string | Array<object>} input
+   * @param {object} [opts] anything `complete()` takes, plus `onDelta` to stream
+   * @returns {Promise<string>}
+   */
+  ask(input, opts) {
+    return ask(this, input, opts);
+  }
+
+  /**
+   * A multi-turn conversation that keeps its own history.
+   *
+   * ```js
+   * const chat = engine.conversation({ system: "You are terse." });
+   * await chat.say("hello");
+   * await chat.say("and again?");   // remembers
+   * ```
+   *
+   * @param {object} [opts] `system`, `keep`, plus `complete()` defaults
+   */
+  conversation(opts) {
+    return conversation(this, opts);
+  }
+
+  /**
+   * Ghost text, with the debounce/supersede/drop-if-stale discipline built in
+   * and the prompt left to you.
+   *
+   * ```js
+   * const ghost = engine.ghostText({ prompt: (before) => `Continue:\n${before}` });
+   * editor.on("input", async () => {
+   *   const hint = await ghost.suggest(editor.textBefore());
+   *   if (hint !== null) render(hint);   // null means a newer keystroke won
+   * });
+   * editor.on("blur", () => ghost.cancel());
+   * ```
+   *
+   * @param {object} opts must include `prompt`
+   */
+  ghostText(opts) {
+    return ghostText(this, opts);
+  }
+
+  /**
+   * Embed text into vectors, through the same scheduler as everything else.
+   *
+   * ```js
+   * const [vector] = await engine.embed("a sentence", { modelId: EMBED_MODEL });
+   * const vectors  = await engine.embed(["one", "two"], { modelId: EMBED_MODEL });
+   * ```
+   *
+   * **Needs an embedding model**, not a chat model — `snowflake-arctic-embed-*`
+   * in WebLLM's prebuilt list, from 239 MB. They are separate models, so this
+   * usually names `modelId` explicitly and holds it resident alongside a chat
+   * model with `load(id, { keepResident: true })`.
+   *
+   * Returns bare vectors because that is what a caller does arithmetic on; the
+   * OpenAI envelope is available as `embedRaw()` for anyone porting code that
+   * expects `data[].embedding`.
+   *
+   * **A running embedding cannot be interrupted.** Cancellation and preemption
+   * work by making a decode loop break out; one forward pass has no loop, so a
+   * `cancel()` that lands after the job starts marks it cancelled but does not
+   * stop it. Queued embeddings supersede and cancel normally. This is tolerable
+   * because an embedding is milliseconds where a completion is seconds — but it
+   * is a weaker guarantee than `complete()` gives, so it is stated rather than
+   * discovered.
+   *
+   * @param {string | string[]} input
+   * @param {{modelId?: string, task?: string, session?: string,
+   *   priority?: string, preemptible?: boolean, id?: string}} [opts]
+   * @returns {Promise<number[][]>} one vector per input, in order
+   */
+  async embed(input, opts = {}) {
+    const { data } = await this.embedRaw(input, opts);
+    return data.map((d) => d.embedding);
+  }
+
+  /** `embed()`, returning WebLLM's OpenAI-shaped envelope untouched. */
+  async embedRaw(input, opts = {}) {
+    const texts = Array.isArray(input) ? input : [input];
+    if (texts.length === 0 || texts.some((t) => typeof t !== "string")) {
+      throw new EngineError(
+        ERROR.BAD_REQUEST,
+        "embed() takes a string or a non-empty array of strings.",
+        { received: Array.isArray(input) ? `array of ${input.length}` : typeof input },
+      );
+    }
+
+    const pool = await this.#ensurePool(opts.modelId);
+    const result = unwrap(
+      await pool.submit({
+        ...scheduling(opts),
+        id: opts.id,
+        kind: JOB_KIND.EMBEDDING,
+        params: { input: texts },
+      }),
+    );
+    return { data: result.embeddings ?? [], usage: result.usage };
+  }
+
   /**
    * Independent prompts, fanned across the pool. This is the only way to beat
    * the ~10 tok/s single-stream ceiling, so anything embarrassingly parallel
@@ -884,14 +1258,51 @@ export class ScheduledEngine {
   async configure(patch) {
     const applied = {};
     if (patch.decodeSteps !== undefined) applied.decodeSteps = clampSteps(patch.decodeSteps);
+    if (patch.engineCount !== undefined) {
+      const n = Math.round(Number(patch.engineCount));
+      if (!Number.isFinite(n) || n < 1) {
+        throw new EngineError(
+          ERROR.BAD_REQUEST,
+          `engineCount must be a positive integer, not ${JSON.stringify(patch.engineCount)}.`,
+          { engineCount: patch.engineCount },
+        );
+      }
+      applied.engineCount = n;
+    }
     if (Object.keys(applied).length === 0) {
-      throw new EngineError(ERROR.BAD_REQUEST, "`configure` needs at least one setting.");
+      // Naming the knobs matters: this is the error a caller hits after
+      // `environment()` told them something was operable, so it has to agree
+      // with that report about what the operable things are.
+      throw new EngineError(
+        ERROR.BAD_REQUEST,
+        "`configure` needs at least one setting. Operable: `decodeSteps`, `engineCount`.",
+        { operable: ["decodeSteps", "engineCount"] },
+      );
     }
     await this.#store.setSettings(applied);
+    // Only `decodeSteps` is hot. `engineCount` is persisted and read when a pool
+    // is built, so a live pool keeps the size it came up with — `environment()`
+    // reports that gap rather than pretending the change took effect.
     let engines = 0;
-    for (const pool of this.#pools.values()) engines += pool.configure(applied);
+    if (applied.decodeSteps !== undefined) {
+      for (const pool of this.#pools.values()) engines += pool.configure({ decodeSteps: applied.decodeSteps });
+    }
     return { settings: applied, engines };
   }
+}
+
+/**
+ * Normalise every folder shape a caller might hold into `{path, file}[]`.
+ *
+ * A drop event gives a `DataTransfer`, `<input webkitdirectory>` gives a
+ * `FileList`, and a caller who has already unpacked one gives the entries. All
+ * three mean "this folder", so `load()` accepts all three rather than making
+ * the caller find the right converter first.
+ */
+async function toEntries(files) {
+  if (isDataTransfer(files)) return filesFromDataTransfer(files);
+  if (isFileList(files)) return filesFromInput(files);
+  return files;
 }
 
 /** Scheduling metadata is per-request; the pool, not the caller, acts on it. */

@@ -20,6 +20,17 @@
  *   ABORTED               the caller cancelled it; not a failure, and not to be
  *                         reported to a user as one
  *   GENERATION_FAILED     the model failed mid-generation
+ *   PACKAGE_INCOMPLETE    this package is not wired into your build correctly —
+ *                         a missing `vendor/` bundle, or a decode worker the
+ *                         bundler did not emit. Fixed once, in the build, by
+ *                         the developer; never branched on at runtime.
+ *
+ * `PACKAGE_INCOMPLETE` covers two causes with one code on purpose. They are
+ * different sentences and `detail.cause` tells them apart, but no caller writes
+ * a different `catch` branch for them: both mean "your build is wrong, the app
+ * has not shipped yet", and both are fixed by editing config, not by handling
+ * an error path. A second code would have grown the table a caller reads
+ * without giving that caller anything new to do.
  *
  * `message` stays human-readable and stays the thing you print. `detail`
  * carries whatever structured context the site had — the missing cache keys,
@@ -34,6 +45,7 @@ export const ERROR = {
   BAD_REQUEST: "BAD_REQUEST",
   ABORTED: "ABORTED",
   GENERATION_FAILED: "GENERATION_FAILED",
+  PACKAGE_INCOMPLETE: "PACKAGE_INCOMPLETE",
 };
 
 export class EngineError extends Error {

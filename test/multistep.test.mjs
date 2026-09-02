@@ -12,7 +12,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { burstSize, clampSteps, installMultiStepDecoding } from "../src/engine/multistep.js";
+import {
+  PIPELINE_CONTRACT,
+  burstSize,
+  clampSteps,
+  installMultiStepDecoding,
+  missingPipelineMembers,
+} from "../src/engine/multistep.js";
 
 // ------------------------------------------------------------------ fakes ---
 
@@ -365,4 +371,93 @@ test("a burst reports its wall time once but its tokens as they drain", async ()
   assert.equal(bursts.length, 1, "one burst");
   assert.equal(bursts[0].steps, 4);
   assert.equal(pipeline.decodingTotalTokens, 4, "usage counts real tokens, not steps attempted");
+});
+
+// ------------------------------------------------- the runtime guard (2d) ---
+
+/**
+ * The static contract test asks whether a name survives in the *bundle*. These
+ * ask the other question: whether it is on the *object we were handed*. A member
+ * can survive upstream and still not reach us — moved to a subclass, to another
+ * pipeline type, behind a factory — and the symptom is not an exception, it is
+ * throughput quietly halving with nothing in the log.
+ */
+const withoutConsoleError = async (fn) => {
+  const original = console.error;
+  const said = [];
+  console.error = (...args) => said.push(args.join(" "));
+  try {
+    await fn();
+  } finally {
+    console.error = original;
+  }
+  return said;
+};
+
+test("a healthy pipeline satisfies the contract", () => {
+  assert.deepEqual(missingPipelineMembers(fakePipeline({ script: [1] })), []);
+});
+
+test("a renamed method routes to stock decode instead of throwing mid-burst", async () => {
+  const pipeline = fakePipeline({ script: [1, 2, 3] });
+  pipeline.fsampleWithTopPV2 = pipeline.fsampleWithTopP;
+  delete pipeline.fsampleWithTopP;
+
+  const engine = fakeEngine();
+  const fallbacks = [];
+  const control = installMultiStepDecoding(engine, {
+    steps: 15,
+    onFallback: (info) => fallbacks.push(info),
+  });
+
+  // outputIds starts at length 1, so max_tokens 4 is three more tokens.
+  const said = await withoutConsoleError(() => drain(engine, pipeline, { max_tokens: 4 }));
+
+  assert.equal(pipeline.device.syncCount, 0, "no burst was attempted");
+  assert.equal(engine.calls.decode, 3, "every token came from stock decode");
+  assert.deepEqual(fallbacks[0].missing, ["fsampleWithTopP() is not a function"]);
+  assert.equal(said.length, 1, "reported once for the pipeline, not once per token");
+  assert.match(said[0], /multi-step decoding disabled/);
+  assert.equal(control.fallbacks, 1);
+});
+
+test("a missing counter is caught — the failure that would not have thrown", () => {
+  // `pipeline.filledKVCacheLength += 1` on an absent member throws nothing: it
+  // creates the property, the burst runs, and the KV accounting silently drifts.
+  // Presence-only checking would have to *call* something to notice.
+  const pipeline = fakePipeline({ script: [1] });
+  delete pipeline.filledKVCacheLength;
+  assert.deepEqual(missingPipelineMembers(pipeline), ["filledKVCacheLength is not a number"]);
+});
+
+test("an absent logitProcessor is not a broken pipeline", () => {
+  // It is read as `!== undefined` to decide whether to burst at all, so absent
+  // is the normal case. Requiring it would disable the fast path everywhere.
+  const pipeline = fakePipeline({ script: [1] });
+  assert.equal(pipeline.logitProcessor, undefined);
+  assert.deepEqual(missingPipelineMembers(pipeline), []);
+  assert.ok(PIPELINE_CONTRACT.optional.includes("logitProcessor"));
+});
+
+test("the check runs once per pipeline, not once per decode", async () => {
+  const pipeline = fakePipeline({ script: [1, 2, 3, 4, 5, 6] });
+  const engine = fakeEngine();
+
+  // `resetChat` is the one declared member a healthy run never touches — it is
+  // only the rewind path's last resort — so reads of it count contract scans and
+  // nothing else.
+  let scans = 0;
+  const real = pipeline.resetChat;
+  Object.defineProperty(pipeline, "resetChat", {
+    get() {
+      scans += 1;
+      return real;
+    },
+  });
+
+  installMultiStepDecoding(engine, { steps: 2 });
+  await drain(engine, pipeline, { max_tokens: 7 });
+
+  assert.ok(pipeline.device.syncCount > 1, "the run spanned several bursts");
+  assert.equal(scans, 1, "the contract was scanned once, not once per burst");
 });

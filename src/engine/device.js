@@ -100,11 +100,22 @@ export async function probeDevice() {
 }
 
 /** `adapter.info` is the current spec; `requestAdapterInfo()` was the old one. */
+/**
+ * What the adapter will admit about itself, with blanks dropped.
+ *
+ * Firefox 154 exposes `adapter.info` but fills every field with `""`, so the
+ * naive shape is an object that *looks* populated and renders as "GPU:   ". A
+ * caller cannot tell that from a real answer without checking each string, so
+ * empty fields are omitted and a browser that says nothing yields `{}` — the
+ * same thing the no-info path already returns.
+ */
 async function adapterInfo(adapter) {
   const info = adapter.info ?? (await adapter.requestAdapterInfo?.().catch(() => null));
   if (!info) return {};
   const { vendor, architecture, device, description } = info;
-  return { vendor, architecture, device, description };
+  return Object.fromEntries(
+    Object.entries({ vendor, architecture, device, description }).filter(([, v]) => v),
+  );
 }
 
 async function probeStorage() {

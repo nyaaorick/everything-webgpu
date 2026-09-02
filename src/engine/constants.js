@@ -23,6 +23,35 @@ export const PRIORITY = {
 
 export const PRIORITY_ORDER = [PRIORITY.INTERACTIVE, PRIORITY.NORMAL, PRIORITY.BACKGROUND];
 
+/**
+ * How far `unload()` goes.
+ *
+ * Two levels rather than two verbs because they are the same intention at
+ * different depths — "I am done with this model" — and the caller should not
+ * have to know that freeing VRAM and freeing disk are different subsystems.
+ * Forgetting the model *entirely* is `remove()`, which stays its own verb
+ * because it is the one that cannot be undone without re-supplying the source.
+ */
+export const UNLOAD_LEVEL = {
+  /** Default. Free VRAM, keep the cached bytes — so reloading costs no network. */
+  VRAM: "vram",
+  /** Also delete the cached bytes. The registry entry survives, so the model is still known. */
+  CACHE: "cache",
+};
+
+/**
+ * What a queued job asks its engine to do.
+ *
+ * One pool, not two: priority, session supersession, preemption and
+ * one-task-one-engine are identical for both, and the only thing that differs
+ * is the call at the far end. A second pool would have duplicated the
+ * scheduler to change one line.
+ */
+export const JOB_KIND = {
+  CHAT: "chat",
+  EMBEDDING: "embedding",
+};
+
 /** Engine lifecycle states. */
 export const ENGINE_STATE = {
   IDLE: "idle",

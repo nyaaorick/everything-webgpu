@@ -9,11 +9,11 @@ import { ERROR, EngineError } from "./errors.js";
 import { CACHE_CONFIG, CACHE_MODEL, CACHE_WASM, SOURCE, baseUrlFor, toModelType } from "./model-store.js";
 
 /** WebLLM asks for this name; older MLC exports ship `ndarray-cache.json`. */
-const TENSOR_MANIFEST = "tensor-cache.json";
-const LEGACY_TENSOR_MANIFEST = "ndarray-cache.json";
-const CHAT_CONFIG = "mlc-chat-config.json";
+export const TENSOR_MANIFEST = "tensor-cache.json";
+export const LEGACY_TENSOR_MANIFEST = "ndarray-cache.json";
+export const CHAT_CONFIG = "mlc-chat-config.json";
 
-const CONTENT_TYPES = {
+export const CONTENT_TYPES = {
   json: "application/json",
   wasm: "application/wasm",
   bin: "application/octet-stream",
@@ -24,13 +24,17 @@ const CONTENT_TYPES = {
  * Uses the entries API so dropping a *folder* works, not just a file selection.
  */
 export async function filesFromDataTransfer(dataTransfer) {
-  const roots = [...dataTransfer.items]
+  // `Array.from` throughout, for the reason `filesFromInput` gives: a
+  // DataTransferItemList and a FileList are array-like, and only sometimes
+  // iterable. Spreading them threw from inside here, three frames from the drop
+  // handler the caller actually wrote.
+  const roots = Array.from(dataTransfer.items)
     .filter((item) => item.kind === "file")
     .map((item) => (item.webkitGetAsEntry ? item.webkitGetAsEntry() : null));
 
   if (roots.some((entry) => entry === null)) {
     // No entries API: fall back to the flat file list (a folder drop yields nothing).
-    return [...dataTransfer.files].map((file) => ({
+    return Array.from(dataTransfer.files, (file) => ({
       path: file.webkitRelativePath || file.name,
       file,
     }));
@@ -56,9 +60,16 @@ async function walkEntry(entry, prefix, out) {
   }
 }
 
-/** Turns `<input webkitdirectory>` output into the same `{ path, file }` shape. */
+/**
+ * Turns `<input webkitdirectory>` output into the same `{ path, file }` shape.
+ *
+ * `Array.from`, not spread: a real `FileList` is iterable, but plenty of things
+ * that behave like one are only array-like, and spreading those fails with
+ * "fileList is not iterable" — an error that names none of the three places it
+ * could have come from. Array.from accepts both.
+ */
 export function filesFromInput(fileList) {
-  return [...fileList].map((file) => ({
+  return Array.from(fileList, (file) => ({
     path: file.webkitRelativePath || file.name,
     file,
   }));
