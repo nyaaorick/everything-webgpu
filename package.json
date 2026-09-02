@@ -5,7 +5,7 @@
   "scripts": {
     "build": "node build.mjs",
     "check": "node build.mjs --check-entries",
-    "test": "node --test test/webllm-contract.test.mjs test/patches.test.mjs test/readme.test.mjs test/api-doc.test.mjs test/examples.test.mjs test/integration.test.mjs test/scheduler.test.mjs test/multistep.test.mjs test/environment.test.mjs test/sources.test.mjs test/prefetch.test.mjs test/embed.test.mjs test/recipes.test.mjs test/errors.test.mjs test/chat.test.mjs test/device.test.mjs test/manage.test.mjs",
+    "test": "node --test test/webllm-contract.test.mjs test/patches.test.mjs test/readme.test.mjs test/api-doc.test.mjs test/examples.test.mjs test/license.test.mjs test/integration.test.mjs test/scheduler.test.mjs test/multistep.test.mjs test/environment.test.mjs test/sources.test.mjs test/prefetch.test.mjs test/embed.test.mjs test/recipes.test.mjs test/errors.test.mjs test/chat.test.mjs test/device.test.mjs test/manage.test.mjs",
     "package": "npm run build && node build.mjs --zip",
     "e2e": "node test/e2e/run.mjs",
     "verify-consumer": "node test/consumer/verify.mjs",
@@ -16,7 +16,7 @@
     "contract": "node --test test/webllm-contract.test.mjs",
     "verify-patches": "node build.mjs --verify-patches"
   },
-  "author": "",
+  "author": "nyaaorick",
   "license": "ISC",
   "dependencies": {
     "@mlc-ai/web-llm": "0.2.84"
@@ -60,6 +60,7 @@
     "src/adapters",
     "src/vite.js",
     "types",
-    "vendor"
+    "vendor/web-llm.js",
+    "THIRD-PARTY-NOTICES.md"
   ]
 }

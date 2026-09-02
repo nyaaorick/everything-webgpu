@@ -463,3 +463,11 @@ npm run verify-patches   # check patch anchors without rebuilding
 
 `@mlc-ai/web-llm` is pinned exactly, because the build rewrites its bundle at verified anchors.
 Bumping it is a documented, guarded procedure — see WEBLLM-SURFACE.md, "Upgrading".
+
+## Licence
+
+This package is **ISC** ([LICENSE](LICENSE)). It ships a pre-built copy of WebLLM
+(`vendor/web-llm.js`, **Apache-2.0**) and its dependency `loglevel` (**MIT**); their full licence
+texts travel in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md), and
+[test/license.test.mjs](test/license.test.mjs) fails the build if a dependency is ever bundled
+without one.

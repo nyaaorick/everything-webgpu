@@ -32,7 +32,13 @@ if (!flag("--check-entries") && !flag("--zip") && !flag("--verify-patches")) {
     format: "esm",
     platform: "browser",
     target: ["firefox115"],
-    legalComments: "none",
+    // `eof`, not `none`: this bundle is redistributed inside our npm tarball, so
+    // any `@license`/`@preserve` banner WebLLM's deps carry has to survive.
+    // Today upstream's own build has already stripped them all (the bundle ends
+    // up byte-for-byte the same either way), and THIRD-PARTY-NOTICES.md is what
+    // actually carries the Apache-2.0 and MIT texts — but `none` would silently
+    // drop a banner a future dependency bump adds.
+    legalComments: "eof",
     // Left readable: WebLLM stack traces are the main diagnostic when a model
     // fails to load, and minifying does not get the bundle under AMO's 5 MB
     // parse limit anyway (see README, "Known limits").
@@ -127,7 +133,10 @@ if (flag("--verify-patches")) {
     format: "esm",
     platform: "browser",
     target: ["firefox115"],
-    legalComments: "none",
+    // Match the shipping build so anchor verification runs against the same
+    // text; `eof` only appends, so anchors (which are code, matched modulo
+    // whitespace) are unaffected either way.
+    legalComments: "eof",
     logLevel: "silent",
   });
   const installed = JSON.parse(
