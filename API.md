@@ -6,9 +6,14 @@ the migration story; this is the catalogue. Asserted against the code by
 package export appears, and the error table equals `ERROR`, so this page cannot drift from the
 source without failing `npm test`.
 
-`chat.completions.create()` is the WebLLM compatibility layer and **never changes** (see
-[Stability](README.md#stability)). Everything else on this page is pre-1.0 and may move; the
-ergonomic verbs are being consolidated in [ROADMAP.md](ROADMAP.md).
+The page is in three tiers. **[Start here](#start-here)** — `load`, `ask`, `conversation`,
+`environment` — is the dead-simple path, and most apps need nothing else. **[Native
+passthrough](#native-passthrough)** is `chat.completions.create()`, the WebLLM/OpenAI compatibility
+layer, which **never changes** (see [Stability](README.md#stability)). **[When you need
+more](#when-you-need-more)** is the rest of the surface: the general calls and their scheduling
+fields, embeddings, residency, device inspection, configuration, lifecycle. Everything outside the
+passthrough is pre-1.0 and may move; the ergonomic verbs are being consolidated in
+[STATUS.md](STATUS.md).
 
 ---
 
@@ -29,34 +34,13 @@ On Vite, add one plugin — see [Bundlers](#bundlers).
 
 ---
 
-## 1. Getting an engine
+## Start here
 
-| call | when |
-| --- | --- |
-| `await CreateScheduledEngine(modelId?, opts?)` | the common case. Loads `modelId` before returning, like WebLLM's `CreateMLCEngine`. Omit it for an engine that loads later. |
-| `new ScheduledEngine({ store, workerUrl?, loadWebLLM?, prebuilt? })` | when you must pass a store explicitly — a worker, a test, an extension. Does **not** load anything. |
+Four calls. Get an engine with `CreateScheduledEngine` (below, under [Getting an
+engine](#getting-an-engine)), then `load` a model, `ask` it things or hold a `conversation`, and
+`environment` tells you whether the machine is up to it.
 
-**`opts` for `CreateScheduledEngine`** — `store`, `initProgressCallback`, `workerUrl`, `loadWebLLM`,
-`prebuilt`. Anything not `store`/`initProgressCallback` is forwarded to the constructor.
-
-| constructor field | default | meaning |
-| --- | --- | --- |
-| `store` | IndexedDB (`CreateScheduledEngine` only; the constructor requires it) | a `ModelStore`, or a bare `StorageAdapter` it wraps |
-| `prebuilt` | `true` | expose WebLLM's 163 HuggingFace models. `false` = offline-only: `load()` resolves registered models and nothing else, and an unknown id fails before the WebLLM bundle is fetched |
-| `workerUrl` | `new URL("./engine-worker.js", import.meta.url)` | the decode worker's module URL |
-| `loadWebLLM` | `() => import("../../vendor/web-llm.js")` | override the bundle source (tests) |
-
-**Stores** — `import { indexedDBStorage } from "everything-webgpu/adapters/idb"` (pages, plus
-`ensurePersistent()`), `everything-webgpu/adapters/memory` (`memoryStorage()`, tests),
-`everything-webgpu/adapters/webext` (`webExtensionStorage()` + `attachWebExtensionTransport()`).
-
-```js
-import { ScheduledEngine, ModelStore } from "everything-webgpu";
-import { memoryStorage } from "everything-webgpu/adapters/memory";
-const engine = new ScheduledEngine({ store: new ModelStore(memoryStorage()) });
-```
-
-## 2. Loading a model
+### Load a model — `engine.load(src, opts?)`
 
 **One call, four source shapes.** `engine.load(src, opts?)` works out what you handed it, registers
 whatever needs registering, and brings the model up.
@@ -85,6 +69,103 @@ await engine.load(dropEvent.dataTransfer);
 await engine.load(input.files, { defer: true });   // register now, build the pool on first use
 ```
 
+`load()` composes the lower-level `registerModel`, `ingestModelFolder` and the download primitives;
+`prefetch()` warms the cache with no GPU. All of that is under [More on
+loading](#more-on-loading).
+
+### Ask one question — `engine.ask(input, opts?)`
+
+One question, its own task, **no session** — two `ask()`s never supersede each other. Returns the
+reply string. `opts.onDelta` to stream. Goes through the same scheduler as everything else: priority
+bands, one-task-one-engine, opt-in preemption.
+
+> **Note on signature**: `engine.ask` is a stateless, one-off generation. Because you may want to pass different generation parameters (like `temperature`, `max_tokens`) per call, it accepts a configuration object `opts`, and `onDelta` is destructured from it.
+
+### Hold a conversation — `engine.conversation(opts)`
+
+A multi-turn chat that keeps its own history. `engine.conversation({ system?, keep?, ...defaults })`
+— one stable task for every turn, turns serialised, history bounded at `keep: 12` exchanges
+(`Infinity` opts out).
+
+```js
+const chat = engine.conversation({ system: "You are terse." });
+await chat.say("capital of France?");            // → { text, finishReason }
+await chat.say("and its population?", onDelta);  // remembers
+chat.messages;  chat.length;  chat.reset();  chat.restore(messages);
+```
+
+> **Note on signature**: `chat.say(msg, onDelta)` belongs to a stateful, long-running conversation. The design intent is that all configuration for this conversation (like `system` prompt, `temperature`, etc.) is fixed once when you create it via `engine.conversation(opts)`. Therefore, `chat.say` intentionally uses a minimal signature — accepting only the current turn's message and the stream callback directly, rather than a complex options object.
+
+### Inspect the machine — `engine.environment(opts?)`
+
+| call | answers |
+| --- | --- |
+| `await engine.environment(opts?)` | **the preflight.** A report; every line has `severity` · `affects` · `cause` · `fix` · `operable`. `{ scope: "local" }` never touches the model layer (poll freely); `{ scope: "device" }` is hardware only. |
+| `await engine.environment.measure()` | one calibration generation → measured tok/s for the current model |
+
+**`environment()` only reports.** Writes go through `configure()`; passing a setting to
+`environment()` is an error that names `configure()`. Per-model "will it run" is
+[`canRun(modelId)`](#inspecting-the-machine); the fuller device surface is there too.
+
+## Native passthrough
+
+The one call that **never changes**. `@mlc-ai/web-llm` is OpenAI-shaped, and so is this: the
+migration off it is a one-line import swap, and `chat.completions.create()` then takes and returns
+exactly the same shapes — same streamed chunk objects, same finish reasons, same non-streaming
+envelope. See [Stability](README.md#stability).
+
+| call | shape |
+| --- | --- |
+| `engine.chat.completions.create(params)` | the **WebLLM/OpenAI** shape, unchanged. Streams the same chunks, same finish reasons. `session`/`priority`/`task`/`preemptible` are additive. |
+
+**`params`** = the OpenAI generation fields WebLLM already speaks (`messages`, `temperature`,
+`max_tokens`, `response_format`, `extra_body`, …) **plus** the scheduling fields that are the only
+thing this adds over calling WebLLM directly:
+
+| field | meaning |
+| --- | --- |
+| `modelId` | load/route to this model instead of the current one |
+| `id` | job id; also what `cancel(id)` takes |
+| `task` | the unit that owns an engine; a whole batch shares one |
+| `session` | a later job with this key supersedes the earlier one |
+| `priority` | `"interactive"` \| `"normal"` \| `"background"` |
+| `preemptible` | may be interrupted by an `interactive` job (set it on the work that can afford to lose) |
+
+`complete()`, `completeRaw()` and `batch()` take the same scheduling fields and expose `cancelled` /
+`preempted` as first-class outcomes the OpenAI shape has no room for — see [The general
+calls](#the-general-calls).
+
+## When you need more
+
+### Getting an engine
+
+| call | when |
+| --- | --- |
+| `await CreateScheduledEngine(modelId?, opts?)` | the common case. Loads `modelId` before returning, like WebLLM's `CreateMLCEngine`. Omit it for an engine that loads later. |
+| `new ScheduledEngine({ store, workerUrl?, loadWebLLM?, prebuilt? })` | when you must pass a store explicitly — a worker, a test, an extension. Does **not** load anything. |
+
+**`opts` for `CreateScheduledEngine`** — `store`, `initProgressCallback`, `workerUrl`, `loadWebLLM`,
+`prebuilt`. Anything not `store`/`initProgressCallback` is forwarded to the constructor.
+
+| constructor field | default | meaning |
+| --- | --- | --- |
+| `store` | IndexedDB (`CreateScheduledEngine` only; the constructor requires it) | a `ModelStore`, or a bare `StorageAdapter` it wraps |
+| `prebuilt` | `true` | expose WebLLM's 163 HuggingFace models. `false` = offline-only: `load()` resolves registered models and nothing else, and an unknown id fails before the WebLLM bundle is fetched |
+| `workerUrl` | `new URL("./engine-worker.js", import.meta.url)` | the decode worker's module URL |
+| `loadWebLLM` | `() => import("../../vendor/web-llm.js")` | override the bundle source (tests) |
+
+**Stores** — `import { indexedDBStorage } from "everything-webgpu/adapters/idb"` (pages, plus
+`ensurePersistent()`), `everything-webgpu/adapters/memory` (`memoryStorage()`, tests),
+`everything-webgpu/adapters/webext` (`webExtensionStorage()` + `attachWebExtensionTransport()`).
+
+```js
+import { ScheduledEngine, ModelStore } from "everything-webgpu";
+import { memoryStorage } from "everything-webgpu/adapters/memory";
+const engine = new ScheduledEngine({ store: new ModelStore(memoryStorage()) });
+```
+
+### More on loading
+
 **Warming the cache first** — `await engine.prefetch(modelId, { onProgress, signal })`. Downloads
 the weights **without building an engine and without WebGPU**, so an app can warm the cache before
 it knows whether the machine can run the model. Interrupted downloads resume; a second call is free.
@@ -99,52 +180,33 @@ WebLLM cannot express this — `reload()` needs a GPU before it fetches a shard.
 | `filesFromInput(input.files)` / `filesFromDataTransfer(dt)` | either browser shape → flat `{ path, file }[]` (the latter is async) |
 | `prefetchModel({ modelId, record, ... })` / `resolveModelUrl(...)` | the engine-free download primitives |
 
-## 3. Generating
-
-Every call below goes through the **same scheduler**: priority bands, `session` supersession,
-one-task-one-engine, opt-in preemption.
-
-### The three ready-made shapes
-
-| call | policy |
-| --- | --- |
-| `await engine.ask(input, opts?)` | one question, its own task, **no session** — two never supersede each other. Returns the reply string. `opts.onDelta` to stream. |
-| `engine.conversation({ system?, keep?, ...defaults })` | a multi-turn chat. One stable task for every turn, turns serialised, history bounded at `keep: 12` exchanges (`Infinity` opts out). |
-| `engine.ghostText({ prompt, debounceMs?, maxTokens?, session?, ...defaults })` | debounce + one session key + `interactive` + **resolves `null` when stale**. `prompt` is **required**, no default. |
-
-```js
-const chat = engine.conversation({ system: "You are terse." });
-await chat.say("capital of France?");            // → { text, finishReason }
-await chat.say("and its population?", onDelta);  // remembers
-chat.messages;  chat.length;  chat.reset();  chat.restore(messages);
-
-const ghost = engine.ghostText({ prompt: (before) => `Continue:\n${before}` });
-const hint = await ghost.suggest(editor.textBefore());  // string | null
-ghost.cancel();  // on blur / accept
-```
-
 ### The general calls
+
+Every call here goes through the **same scheduler** as `ask` / `conversation` / `chat.completions`:
+priority bands, `session` supersession, one-task-one-engine, opt-in preemption.
 
 | call | shape |
 | --- | --- |
 | `await engine.complete(payload, onChunk?)` | `{ text, usage, finishReason, cancelled?, preempted? }`. `onChunk(delta)` streams plain text. |
 | `await engine.completeRaw(payload, onRawChunk?)` | same, but `onRawChunk` gets WebLLM's chunk object verbatim. |
 | `await engine.batch({ requests, task?, ...sched }, onItem?)` | `requests` fanned across the pool as **one task**. Returns `BatchItem[]` — each with `index`, `engineIndex`, `startedAt`, `finishedAt`, and `text`/`usage` or `error`. |
-| `engine.chat.completions.create(params)` | the **WebLLM/OpenAI** shape, unchanged. Streams the same chunks, same finish reasons. `session`/`priority`/`task`/`preemptible` are additive. |
 
-**`payload`** = the OpenAI generation fields WebLLM already speaks (`messages`, `temperature`,
-`max_tokens`, `response_format`, `extra_body`, …) **plus** the scheduling fields:
-
-| field | meaning |
-| --- | --- |
-| `modelId` | load/route to this model instead of the current one |
-| `id` | job id; also what `cancel(id)` takes |
-| `task` | the unit that owns an engine; a whole batch shares one |
-| `session` | a later job with this key supersedes the earlier one |
-| `priority` | `"interactive"` \| `"normal"` \| `"background"` |
-| `preemptible` | may be interrupted by an `interactive` job (set it on the work that can afford to lose) |
+**`payload`** is the OpenAI generation fields plus the scheduling fields — the same table as [Native
+passthrough](#native-passthrough) (`modelId`, `id`, `task`, `session`, `priority`, `preemptible`).
 
 Result flags: `cancelled: true` (superseded or `cancel()`ed), `preempted: true` (`text` is partial).
+
+### Ghost text — `engine.ghostText(opts)`
+
+`engine.ghostText({ prompt, debounceMs?, maxTokens?, session?, ...defaults })` — debounce + one
+session key + `interactive` priority + **resolves `null` when stale**. `prompt` is **required**, no
+default: prompts are model-specific and belong to whoever owns the feature.
+
+```js
+const ghost = engine.ghostText({ prompt: (before) => `Continue:\n${before}` });
+const hint = await ghost.suggest(editor.textBefore());  // string | null
+ghost.cancel();  // on blur / accept
+```
 
 ### Embeddings
 
@@ -160,7 +222,7 @@ alongside a chat model.
 be interrupted** — one forward pass has no decode loop to break out of; queued embeddings supersede
 normally.
 
-## 4. Residency and cache
+### Residency and cache
 
 A resident model is a full copy of its weights in VRAM, and nothing reports free VRAM to a page —
 so residency is explicit.
@@ -178,25 +240,22 @@ so residency is explicit.
 model (free and instant; `load()` is what costs). `engine.resident` lists model ids with a live
 pool. `await engine.cacheState(id)` says what is on disk (`"complete"` / `"partial"` / absent).
 
-## 5. Inspecting the machine
+### Inspecting the machine
+
+The device surface behind the [Start here](#start-here) preflight.
 
 | call | answers |
 | --- | --- |
-| `await engine.environment(opts?)` | **the preflight.** A report; every line has `severity` · `affects` · `cause` · `fix` · `operable`. `{ scope: "local" }` never touches the model layer (poll freely); `{ scope: "device" }` is hardware only. |
-| `await engine.environment.measure()` | one calibration generation → measured tok/s for the current model |
 | `await engine.canRun(modelId)` | per-**model**: `{ ok, blockers, warnings }`, before anything downloads |
 | `await engine.recommendModels(opts?)` | which models this device should be asked to run, best first. `opts`: `maxVramMB`, `needsVision`, `needsToolCalling`, `prefer` |
 | `await engine.estimateSpeed(modelId?)` | projected decode tok/s (uses the measured rate once one generation has happened) |
 | `await engine.probe()` | raw device probe: WebGPU, adapter, `shader-f16`, the five limits, storage quota. Cached. |
-| `await engine.features()` | what is switched **on** now, vs what the device could support |
+| `await engine.features()` | what is switched **on** now, vs what the device could support. `multiStepOff` is non-null when decode fell back to one GPU sync per token — the silent halving `environment()` reports as `degraded` |
 | `engine.hasWebGPU` | `Boolean(navigator.gpu)` |
 | `await engine.listAvailableModels()` | registered + prebuilt, normalised. Costs one bundle fetch. |
 | `engine.listModels()` | registered only — cheap, no bundle load |
 
-**`environment()` only reports.** Writes go through `configure()`; passing a setting to
-`environment()` is an error that names `configure()`.
-
-## 6. Configuration
+### Configuration
 
 `await engine.configure(patch)` — applies a runtime knob and persists it as the default.
 
@@ -209,7 +268,7 @@ pool. `await engine.cacheState(id)` says what is on disk (`"complete"` / `"parti
 Not operable from JS, report-only via `environment()`: KV reuse (derived from the 9-storage-buffer
 cap), compute-pass batching (build-time `NO_PASS_MERGE`), `shader-f16`, GPU, `about:config` flags.
 
-## 7. Lifecycle and cancellation
+### Lifecycle and cancellation
 
 | call | |
 | --- | --- |
@@ -221,7 +280,7 @@ cap), compute-pass batching (build-time `NO_PASS_MERGE`), `shader-f16`, GPU, `ab
 
 `state.status` is one of `ENGINE_STATE`: `"idle"` · `"loading"` · `"ready"` · `"error"`.
 
-## 8. Errors
+## Errors
 
 Every failure is an `EngineError` with a `.code`, a human-readable `.message` (the thing you print),
 and structured `.detail`. `import { isEngineError, ERROR } from "everything-webgpu"`.
@@ -248,9 +307,16 @@ catch (err) {
 
 ## Bundlers
 
-The engine spawns its decode worker with `new Worker(new URL("./engine-worker.js",
-import.meta.url), { type: "module" })`. On **Vite**, its dependency pre-bundler rewrites that URL to
-a path that 404s — in `vite dev`, on a real (non-linked) install only. Add the plugin:
+The engine spawns its decode worker with `new Worker(new URL("../../vendor/worker.bundle.js",
+import.meta.url), { type: "module" })`. That target is **pre-bundled at package build time and has
+no imports of its own** — a worker entry that imports nothing cannot be mis-emitted, because copying
+it verbatim is then the correct thing for a bundler to do. It is a build product, so a checkout that
+never ran `npm run build` (or an install whose `prepare` was skipped) fails with
+`PACKAGE_INCOMPLETE` naming that.
+
+On **Vite**, the dependency pre-bundler moves the module that computes the URL into
+`node_modules/.vite/deps/`, so the URL resolves to a directory that does not exist — in `vite dev`,
+on a real (non-linked) install only. Add the plugin:
 
 ```js
 import { everythingWebGPU } from "everything-webgpu/vite";
@@ -258,9 +324,9 @@ export default defineConfig({ plugins: [everythingWebGPU()] });
 ```
 
 Equivalent by hand: `optimizeDeps: { exclude: ["everything-webgpu"] }`. Skip both and `load()`
-throws `PACKAGE_INCOMPLETE` naming the fix rather than hanging. `vite build` is unaffected either
-way. Other bundlers that honour `new URL(..., import.meta.url)` for workers (Webpack 5, Rollup,
-Parcel 2) need nothing.
+throws `PACKAGE_INCOMPLETE` naming the fix rather than hanging. `vite build` needs neither. Other
+bundlers that honour `new URL(..., import.meta.url)` for workers (Webpack 5, Rollup, Parcel 2) need
+nothing.
 
 ## Every export
 
@@ -305,7 +371,7 @@ Parcel 2) need nothing.
 | --- | --- |
 | `everything-webgpu` | everything above |
 | `everything-webgpu/vite` | `everythingWebGPU()` Vite plugin |
-| `everything-webgpu/worker` | the decode worker entry (for a custom `workerUrl`) |
+| `everything-webgpu/worker` | the pre-bundled decode worker (for a custom `workerUrl`); a build product, import-free |
 | `everything-webgpu/adapters/idb` | `indexedDBStorage()` |
 | `everything-webgpu/adapters/memory` | `memoryStorage()` |
 | `everything-webgpu/adapters/webext` | `webExtensionStorage()`, `attachWebExtensionTransport()` |
