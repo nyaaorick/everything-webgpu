@@ -286,3 +286,207 @@ stripped first, and `PIPELINE_CONTRACT` is asserted to equal what the source act
 
 **The flow, documented (2e).** Moved to WEBLLM-SURFACE.md so the doc you must revise on a bump is
 the doc that tells you how.
+
+
+## Verb consolidation — the ergonomic layer
+
+`chat.completions.create()` is the compatibility layer and never changes. Everything here is
+*additional* — the verbs a developer reaches for when they are not porting WebLLM code.
+
+**`load(src, opts)` — one polymorphic entry.** Absorbs `load` + `registerModel` +
+`ingestModelFolder`. Dispatch is a pure, synchronous `classifySource()` in
+[src/engine/sources.js](src/engine/sources.js), so all four shapes — prebuilt id, HF/hosted URL,
+`{model, modelLib}`, folder off disk — are testable with no GPU and no store. `registerModel` and
+`ingestModelFolder` stay exported unchanged; `load()` composes them.
+
+Two dispatch rules were **dropped after measuring**, both because a wrong guess surfaces as a 404
+deep inside the loader:
+
+- **`modelLib` is never guessed.** `<base><id>-webgpu.wasm` matches **0 of 163** prebuilt models
+  (real names carry a `_cs1k`-style suffix, drop `-MLC`) and **0 of 163** host the lib on the
+  weights' origin (they live on `raw.githubusercontent.com`). A remote source without `modelLib`
+  fails in the classifier with that sentence, before any fetch.
+- **`/resolve/main/` is not derived for HF URLs.** WebLLM's `cleanModelUrl` already appends it; doing
+  it ourselves double-applies. A test asserts the stored URL is byte-identical to what was passed.
+
+The id *is* derived from the URL's last segment — safe where `modelLib` is not, because an id is a
+key in our own registry, never a path anything fetches, so a wrong guess is visible immediately and
+free. `{ id }` overrides. `defer: true` on a bare prebuilt id is an **error**, not a silent load —
+that silent load is the trap the whole section exists to avoid. Unknown ids get near-match hints.
+
+Six mutation tests. One false pass worth remembering: the near-match hint appears at **two** error
+sites and `String.replace` mutated only the first, so a working guard looked untested — a mutation
+that does not apply is indistinguishable from a guard that does not work. Two latent crashes fixed
+on the way: `filesFromInput`/`filesFromDataTransfer` spread their argument, so an array-like-but-not-
+iterable `FileList`/`DataTransferItemList` died with `fileList is not iterable` three frames from
+the caller's drop handler. Both use `Array.from` now.
+
+**`unload(id, level)` — two depths, not two verbs.** `UNLOAD_LEVEL` is `"vram"` (default: free
+VRAM, keep cache + record) or `"cache"` (also delete bytes, keep record — the old `evict()`).
+`remove()` keeps its own verb: it is the one that cannot be undone without re-supplying the source.
+An unrecognised level is refused with an error pointing at `remove()`, because "forget this model"
+is the reading someone will try to spell as a level and it is the destructive one.
+
+**[settled] A bare `unload()` frees only the current model**, with `unloadAll()` explicit for the
+rest. The plan had the bare call free *everything*; shipping that silently would trap anyone already
+calling `unload()`. "Free everything" is the more destructive reading and should be asked for by
+name. `#evictBytes()` was split out of `evict()` so `unload(id, "cache")` reaches the bytes without
+re-entering the class for a pool just torn down.
+
+**`environment()` — read-only report; `.measure()` on it.** Absorbs `probe` + `features` +
+`estimateSpeed` for the *reporting* half. [src/engine/environment.js](src/engine/environment.js), a
+callable `engine.environment` cached like `chat`. Three open questions were all resolved by one
+decision — **split read from write**: `environment()` reports only, writes go through `configure()`,
+and passing a setting to `environment()` is an *error naming `configure()`*, not a silent no-op.
+Implicit read/write dispatch by argument shape is the opposite of foolproof — the "reject or
+write-then-report?" question had no intuitive answer precisely because one function was doing two
+jobs.
+
+Every report line carries `severity` · `affects` · `cause` · `fix` · `operable`, with **`fix: null`
+⟺ `operable: false`** asserted for every line — hardware, build-time flags and browser settings
+report a consequence with no remedy, which is still the difference between a bug report and an
+informed decision. A **blocked device short-circuits the report**: "K=15 forward steps per GPU sync"
+next to "no model can load" is true and useless. `configure()` grew `engineCount` because the report
+advertises it as operable and a report naming a call that throws is worse than no report — it is
+persisted, not hot, and `environment()` reports that gap rather than pretending. The `multiStepOff`
+guard (§2d) finally has a consumer: a `degraded` line naming the missing internal, where before it
+was posted by the worker and read by nothing.
+
+Seven mutation tests. One real hole found: "`local` never fetches" was tested with a fetch counter,
+but `load()` caches the model's size so `estimateSpeed()` short-circuits and *neither* scope fetches
+after a load. The guarantee is structural — `local` never consults the model layer — and is tested
+that way now.
+
+
+## Engine capability — prefetch, embeddings, recipes
+
+**`prefetch(modelId)`** — [src/engine/prefetch.js](src/engine/prefetch.js). Downloads a model with
+no engine and **no WebGPU at all**: an app can warm the cache before it knows whether the machine
+can run the model. Resumes; a second call is free.
+
+The hard part: fetching the artifacts ourselves means deriving their URLs — the `/resolve/main/`
+rule the verb-consolidation work above refused to derive. That refusal still holds; it was about not
+deriving a URL *WebLLM will derive again at load*, which double-applies. Here WebLLM is not in the
+loop — we are the loader. What makes it safe is not trusting the derivation: a key off by one
+character writes a cache the loader never reads, and prefetch would report success while the user
+downloads the model twice. So every prefetch ends by asking **WebLLM's own `hasModelInCache`** —
+which derives through the very function we mirror — and throws if it says no. The contract test also
+pulls `cleanModelUrl` out of the bundle and *runs* it against ours on six URL shapes, so an upstream
+scheme change fails a test, not a download. Seven mutation tests, all caught.
+
+**Embeddings (`engine.embed()`)** — a `kind` field on the job and one branch in
+[pool.js](src/engine/pool.js) `#start`. **One pool, not two**: priority, supersession, preemption
+and one-task-one-engine are identical for both kinds; only the call at the far end differs. A second
+pool would have duplicated the scheduler to change one line. `embed()` returns bare vectors,
+`embedRaw()` keeps WebLLM's envelope. **Known limit:** a running embedding cannot be interrupted —
+`interruptGenerate()` works by making a decode loop break out, and one forward pass has no loop, so
+a cancel that lands after the job starts marks it cancelled without stopping it. Stated in the
+JSDoc, the README and a `[known limit]` test rather than left to be discovered. Six mutations, five
+caught; the sixth was *equivalent* — `#start` decides on an explicit `=== EMBEDDING` and any unknown
+kind routes to chat either way.
+
+**Recipes — `ask()`, `conversation()`, `ghostText()`** — [src/engine/recipes.js](src/engine/recipes.js),
+also methods on the engine. Scope grew on request: one command for each of the three things apps
+actually want. The scheduling shipped as specified — one stable `session`, `interactive`, short
+`max_tokens`, debounce, `cancel()` on blur, stale contexts dropped — and **prompts stayed with the
+caller**: `ghostText({ prompt })` is required with no default; `ask`/`conversation` carry the
+caller's text through. The engine authors nothing.
+
+The piece worth keeping: `suggest()` **resolves `null` when stale**. The engine already superseded
+the work; what a caller still had to remember was not to *paint* the answer that came back anyway.
+Returning `null` removes the choice — the difference between a policy and a wrapper.
+`conversation()` bounds history at 12 exchanges, derived from AI.md's numbers: with no cross-turn KV
+reuse every turn re-prefills at ~5.27 ms/token, so unbounded history is quadratic and a turn near
+the limit waits ~22 s. `keep: Infinity` opts out.
+
+Found and fixed: a **promise leak in the debounce**. A newer keystroke called `clearTimeout` on the
+previous waiter, whose `await` then had nothing to resolve it — every superseded keystroke leaked a
+promise that never settled, and `Promise.all` over a burst hung forever. A superseded waiter has to
+be woken and told it lost, not merely disarmed. Twelve mutation tests; two initially passed — one
+equivalent, one genuinely vacuous: `sent[0].session === sent[1].session` also holds when *neither*
+has a session, which is exactly the regression it was meant to catch. Presence is asserted before
+equality now.
+
+
+## Shipping 0.1.0 — installable, documented, on npm
+
+The library was extracted, tested and complete, and served the project's goal — "make WebLLM easier
+to use, foolproof to build on" — **for nobody**, because it was unpublished, undocumented as a whole
+surface, and un-installable. This section is the gap between "the code is done" and "a developer can
+`npm i` it and run four lines."
+
+**Four-line target, met without an engine change.** `import` / `CreateScheduledEngine(id)` /
+`engine.ask(prompt)` / read the string. Probing the shape found three things that stopped it being
+*usable*:
+
+1. **Un-installable.** `vendor/web-llm.js` is a build product and is gitignored; there was only a
+   `prepublishOnly`, and npm runs **`prepare`** for a git dependency. So `npm i` 404'd (`"private":
+   true`) and a git dependency installed but could not run, failing with `GENERATION_FAILED: Cannot
+   find module .../vendor/web-llm.js` — wrong twice, since nothing had begun generating and the path
+   named is ours. Now `"prepare": "node build.mjs"`, `private` removed. Verified by deleting
+   `vendor/` and running `npm install` — it comes back.
+2. **Looked like a hung process.** No `initProgressCallback` meant zero output during a minutes-long
+   ~0.8 GB download. `CreateScheduledEngine` now distinguishes three states: `undefined` → a
+   throttled console reporter (1 line/second; 58 shard callbacks → 2 lines; the 100% report is never
+   dropped), `null` → explicit silence, a function → unchanged. **`new ScheduledEngine()` stays
+   silent** — a library core that logs is wrong in a worker, an extension background page, or a
+   test. This is the getting-started facade only.
+3. **The Vite worker-URL break.** Vite's dependency pre-bundler copies `new Worker(new
+   URL("./engine-worker.js", import.meta.url))` verbatim into `node_modules/.vite/deps/`, where the
+   sibling file does not exist — `vite dev` only, real (non-linked) install only, `vite build`
+   unaffected. `everything-webgpu/vite` ships a plugin (`optimizeDeps.exclude`, the manual
+   equivalent still documented). And if a consumer does neither, `load()` now fails with
+   `PACKAGE_INCOMPLETE` naming the fix, because `new Worker()` does not throw on a 404 — it fires one
+   `error` event and goes quiet, so the handshake is raced against it.
+
+**`PACKAGE_INCOMPLETE` is one code for two causes** (`detail.cause` separates them). No caller
+writes a different `catch` branch: both mean "your build is wrong, this app has not shipped," both
+are fixed in config. A second code would grow the table a caller reads without giving them anything
+to do.
+
+**`verify-consumer` — the only test that can see the consumer's world.** Everything under `test/`
+and every `examples/` project reaches the package through a *linked* path, and Vite never
+pre-bundles a linked package — so none of them can exercise the one failure that reaches users. This
+blind spot produced a **wrong claim in the docs**: that `optimizeDeps.exclude` was needed for `vite
+build` and that the examples proved it. Measured on a real tarball install, neither holds — build
+output is byte-identical with and without it. `npm run verify-consumer` packs the tarball, installs
+it for real, and asserts three outcomes separately: `vite build` emits the worker chunk and keeps
+WebLLM lazy; `vite dev` **without** the plugin still 404s the worker; `vite dev` with it resolves.
+The middle one is asserted as a *failure* on purpose — a fix whose absence changes nothing is not a
+fix, and if Vite ever stops pre-bundling this package that assertion says the plugin is dead weight.
+
+**`API.md` — every call form on one page,** asserted by
+[test/api-doc.test.mjs](test/api-doc.test.mjs), derived from the source the way `readme.test.mjs`
+is: every `engine.x(` named resolves to a real member, **no public member is left undocumented**
+(the reverse direction the README test lacks), the error table equals `ERROR`, every export
+appears, enum-value rows match the real objects, the subpath table equals `package.json` `exports`.
+Writing it found `engine.store` undocumented and a regex reading enum rows as error codes.
+
+**`examples/` — bare, react, webext,** each a standalone project depending on the package as
+`file:../..` so it resolves through the **`exports` map** — an example importing
+`../../src/engine/index.js` would still run and would still leave the exports map, the `files` list
+and every entry path untested. [test/examples.test.mjs](test/examples.test.mjs) derives its checks
+from the example sources, so a fourth example is covered the moment its directory exists. Also
+closed a silent `files`/`exports` gap: a new export path that `files` would not publish resolves in
+the checkout and 404s in the tarball. Asserted from `package.json` now.
+
+**Bundle-size story, measured not estimated:** **53 kB (~19 kB gzip)** entry chunk before a model
+loads; the 6 MB WebLLM bundle is a **lazy chunk** fetched on the first `load()` or
+`listAvailableModels()` and never by a visitor who does neither; the IndexedDB adapter is a further
+0.8 kB lazy chunk that vanishes when a host brings its own store — the webext build emits no `idb`
+chunk at all, which is that claim tested by construction.
+
+**Licence compliance.** Publishing `vendor/web-llm.js` redistributes WebLLM (Apache-2.0) and its
+dependency `loglevel` (MIT), and the esbuild bundle was built `legalComments: "none"` — no notice
+survived, a violation. `THIRD-PARTY-NOTICES.md` now carries the full texts, generated from the
+installed packages; [test/license.test.mjs](test/license.test.mjs) fails the build if a bundled
+dependency ever lacks a notice, catching a future web-llm bump that inlines a new dep. `build.mjs`
+uses `legalComments: "eof"` now — upstream has already stripped every `@license` banner (the bundle
+is byte-identical either way today), but `"none"` would silently drop one a future dep adds. `LICENSE`
+added (ISC). `files` scopes `vendor` to `web-llm.js` — the stale, unreferenced `vendor/web-llm.d.ts`
+was shipping and made the tarball depend on disk state.
+
+**Published:** `everything-webgpu@0.1.0`, 46 files, 2.3 MB packed; `dist.integrity` matched the
+dry-run exactly. Still deferred to a later version: the `demo` extension rebuilding on the package
+(the source-tree acceptance test for the extraction), and a `repository` field once the repo has a
+remote.
