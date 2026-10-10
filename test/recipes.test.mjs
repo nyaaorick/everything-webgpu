@@ -25,8 +25,6 @@ const { ScheduledEngine } = await import("../src/engine/engine.js");
 const { ModelStore } = await import("../src/engine/model-store.js");
 const { memoryStorage } = await import("../src/adapters/memory.js");
 
-const MODEL = "Test-1B-q4f16_1-MLC";
-
 /**
  * An engine whose `complete()` is replaced by a recorder. The recipes are a
  * policy layer over `complete()`, so what they *ask for* is the whole contract.

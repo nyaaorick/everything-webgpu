@@ -124,7 +124,7 @@ export const PIPELINE_CONTRACT = {
     "topPDevice",
     "tvm",
   ],
-  optional: ["logitProcessor"],
+  optional: ["logitProcessor", "rnnState"],
 };
 
 /**
@@ -494,6 +494,14 @@ function discardLookahead(pipeline, state) {
   const n = state.queue.length;
   state.queue = [];
   if (n === 0) return;
+
+  // Hybrid/recurrent models can expose kv_state_popn while retaining no RNN
+  // rollback history. Popping their states throws inside WASM (and logs even
+  // when caught). A full prefill safely rebuilds both state kinds instead.
+  if (pipeline.rnnState !== undefined) {
+    pipeline.resetChat(/* keepStats= */ true);
+    return;
+  }
 
   const { tvm } = pipeline;
   try {

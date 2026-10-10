@@ -24,6 +24,27 @@
  *                         a missing `vendor/` bundle, or a decode worker the
  *                         bundler did not emit. Fixed once, in the build, by
  *                         the developer; never branched on at runtime.
+ *   NO_ENGINE_HOST        the engine lives in another context and that context
+ *                         is not running — an MV3 extension whose engine tab is
+ *                         closed. Open it and retry.
+ *   TRANSPORT             the message channel failed, not the model — a port
+ *                         that died mid-request, a payload that would not
+ *                         structured-clone. Retryable; the model is fine.
+ *
+ * `TRANSPORT` exists because the alternative was actively misleading. Every
+ * failure crossing the adapter boundary used to fall back to
+ * `GENERATION_FAILED`, which a UI is entitled to read as "the model broke" — so
+ * a disconnected port told the user their model had failed and invited them to
+ * reload a gigabyte that was never the problem. The two codes want opposite
+ * responses: retry the message, versus stop and investigate the model.
+ *
+ * `NO_ENGINE_HOST` earns its own code rather than folding into `NO_MODEL`
+ * because the caller's move is different and *recoverable*: not "register a
+ * model" but "open the tab that holds one". Under MV3 the background page
+ * cannot hold a multi-GB model (STATUS.md, "MV3 migration"), so this is the one
+ * failure a correctly-built MV3 extension still hits in normal use — a UI that
+ * cannot tell it apart would tell the user to re-register a model they already
+ * have.
  *
  * `PACKAGE_INCOMPLETE` covers two causes with one code on purpose. They are
  * different sentences and `detail.cause` tells them apart, but no caller writes
@@ -46,6 +67,32 @@ export const ERROR = {
   ABORTED: "ABORTED",
   GENERATION_FAILED: "GENERATION_FAILED",
   PACKAGE_INCOMPLETE: "PACKAGE_INCOMPLETE",
+  NO_ENGINE_HOST: "NO_ENGINE_HOST",
+  TRANSPORT: "TRANSPORT",
+};
+
+/**
+ * The values `detail.cause` takes, for the codes that carry one.
+ *
+ * `cause` is a second discriminator under a single code: the code says what the
+ * caller should *do*, `cause` says which sentence explains why. It stayed a
+ * bare string literal at four call sites for as long as it only decorated
+ * `PACKAGE_INCOMPLETE`, where nobody branches on it. `NO_ENGINE_HOST` changed
+ * that — there, `cause` separates the recoverable case ("open the engine tab")
+ * from the one no user action fixes ("this browser has no API to open one"), so
+ * a caller genuinely does read it. A value a caller reads is a value a typo can
+ * break, and `"no-tab-api"` for `"no-tabs-api"` is invisible in a string
+ * literal. Same reasoning as `ERROR` itself, applied one level down.
+ */
+export const CAUSE = {
+  /** PACKAGE_INCOMPLETE: `vendor/` was never built. */
+  VENDOR_BUNDLE_MISSING: "vendor-bundle-missing",
+  /** PACKAGE_INCOMPLETE: the bundler did not emit a reachable decode worker. */
+  WORKER_UNREACHABLE: "worker-unreachable",
+  /** NO_ENGINE_HOST: no `chrome.offscreen`, so no offscreen host can exist. */
+  NO_OFFSCREEN_API: "no-offscreen-api",
+  /** NO_ENGINE_HOST: no `tabs` API, so no host tab can be opened. */
+  NO_TABS_API: "no-tabs-api",
 };
 
 export class EngineError extends Error {
@@ -78,7 +125,13 @@ export class EngineError extends Error {
 export function asEngineError(err, fallback = ERROR.GENERATION_FAILED) {
   if (err instanceof EngineError) return err;
   const message = String(err?.message ?? err);
-  return new EngineError(fallback, message);
+  const wrapped = new EngineError(fallback, message);
+  // Keep the original reachable. Under MV3 the background is evicted and rebuilt
+  // constantly, so a rewritten message with no stack leaves nothing that points
+  // back at the throw site. `cause` is the standard Error field for exactly this
+  // and does not disturb `toJSON()`, which only serialises `detail`.
+  if (err instanceof Error) wrapped.cause = err;
+  return wrapped;
 }
 
 export const isEngineError = (err, code) =>

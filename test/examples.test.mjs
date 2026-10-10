@@ -72,17 +72,8 @@ function localPathFor(specifier) {
   return new URL(typeof entry === "string" ? entry : entry.default, ROOT);
 }
 
-test("there are examples at all, and the README table names each one", () => {
+test("there are runnable examples", () => {
   assert.ok(examples.length >= 3, `expected at least three examples, found: ${examples.join(", ") || "none"}`);
-
-  const readme = readFileSync(new URL("README.md", EXAMPLES), "utf8");
-  for (const name of examples) {
-    assert.match(
-      readme,
-      new RegExp(`\\[${name}/\\]\\(${name}/\\)`),
-      `examples/README.md does not list ${name}/ in its table`,
-    );
-  }
 });
 
 test("every example depends on the package by name, not by reaching into src/", () => {

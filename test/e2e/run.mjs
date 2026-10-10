@@ -29,7 +29,17 @@ const MODEL_DIR = (process.env.MODEL_DIR ?? join(homedir(), "Downloads", "Qwen3.
 const FIREFOX = process.env.FIREFOX ?? "/Applications/Firefox.app/Contents/MacOS/firefox";
 
 const MANIFEST = join(ROOT, "manifest.json");
-const BG_HTML = join(ROOT, "src/background/background.html");
+/**
+ * The self-test rides in the **engine host**, not the background.
+ *
+ * Under MV2 those were the same place. Under MV3 they are not, and the
+ * difference is the whole point of the migration: the background is an event
+ * page that owns nothing and can be evicted at any moment, while the engine —
+ * and therefore `navigator.gpu`, the GPU bench, and everything worth measuring
+ * — lives in a tab. Benching the background would measure the wrong context,
+ * and would keep passing after the engine moved out of it.
+ */
+const HOST_HTML = join(ROOT, "src/host/host.html");
 const DEVTEST_DIR = join(ROOT, "src/devtest");
 
 if (!existsSync(MODEL_DIR)) {
@@ -50,21 +60,43 @@ if (!existsSync(MODEL_DIR)) {
  * exactly when you want to notice one. A clean file is restored byte-for-byte.
  */
 const manifestRaw = readFileSync(MANIFEST, "utf8");
-const bgRaw = readFileSync(BG_HTML, "utf8");
+const hostRaw = readFileSync(HOST_HTML, "utf8");
 
-const manifestDirty = JSON.parse(manifestRaw).permissions.some((p) => p.startsWith("http://127.0.0.1"));
-const bgDirty = bgRaw.includes("devtest");
+/**
+ * MV3 split what MV2 kept in one list: API permissions stay in `permissions`,
+ * match patterns move to `host_permissions`. The dev server's origin is a match
+ * pattern, so it belongs to the latter — and the dirty check has to look where
+ * the patch actually lands, or a killed run leaves a permission behind that
+ * nothing ever strips.
+ */
+const hostPerms = (m) => (m.manifest_version >= 3 ? "host_permissions" : "permissions");
+const isDevServer = (p) => p.startsWith("http://127.0.0.1");
+
+const manifestDirty = (() => {
+  const m = JSON.parse(manifestRaw);
+  return (m[hostPerms(m)] ?? []).some(isDevServer) || backgroundScripts(m).some((s) => s.includes("devtest"));
+})();
+const hostDirty = hostRaw.includes("devtest");
+
+/** `background.scripts` under MV3; `[]` for an MV2 background *page*. */
+function backgroundScripts(m) {
+  return m.background?.scripts ?? [];
+}
 
 const manifestBefore = manifestDirty
   ? (() => {
       const m = JSON.parse(manifestRaw);
-      m.permissions = m.permissions.filter((p) => !p.startsWith("http://127.0.0.1"));
+      const key = hostPerms(m);
+      m[key] = (m[key] ?? []).filter((p) => !isDevServer(p));
+      if (m.background?.scripts) {
+        m.background.scripts = m.background.scripts.filter((s) => !s.includes("devtest"));
+      }
       return JSON.stringify(m, null, 2) + "\n";
     })()
   : manifestRaw;
-const bgBefore = bgDirty
-  ? bgRaw.split("\n").filter((l) => !l.includes("devtest")).join("\n")
-  : bgRaw;
+const hostBefore = hostDirty
+  ? hostRaw.split("\n").filter((l) => !l.includes("devtest")).join("\n")
+  : hostRaw;
 let firefox;
 let server;
 
@@ -91,7 +123,7 @@ function reapFirefoxProfiles() {
 
 function restore() {
   writeFileSync(MANIFEST, manifestBefore);
-  writeFileSync(BG_HTML, bgBefore);
+  writeFileSync(HOST_HTML, hostBefore);
   rmSync(DEVTEST_DIR, { recursive: true, force: true });
   firefox?.kill("SIGTERM");
   // web-ext is the parent; Firefox itself outlives it unless killed by profile.
@@ -108,9 +140,16 @@ try {
   // Wire the self-test in.
   cpSync(join(import.meta.dirname, "page"), DEVTEST_DIR, { recursive: true });
   const manifest = JSON.parse(manifestBefore);
-  manifest.permissions = [...manifest.permissions, `http://127.0.0.1:${PORT}/*`];
+  const permsKey = hostPerms(manifest);
+  manifest[permsKey] = [...(manifest[permsKey] ?? []), `http://127.0.0.1:${PORT}/*`];
+  // MV3 only: nothing opens the engine host on its own, and the page that
+  // reports results is opened *by* the host. Without this the run would wait
+  // out its full ten minutes having never started.
+  if (manifest.background?.scripts) {
+    manifest.background.scripts = [...manifest.background.scripts, "src/devtest/openhost.js"];
+  }
   writeFileSync(MANIFEST, JSON.stringify(manifest, null, 2) + "\n");
-  writeFileSync(BG_HTML, bgBefore + '<script type="module" src="../devtest/boot.js"></script>\n');
+  writeFileSync(HOST_HTML, hostBefore + '<script type="module" src="../devtest/boot.js"></script>\n');
 
   let onReport;
   const report = new Promise((res) => (onReport = res));

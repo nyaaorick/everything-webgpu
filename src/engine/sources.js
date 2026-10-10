@@ -20,7 +20,7 @@
  *  - **`/resolve/main/` is never derived for HuggingFace URLs.** WebLLM's
  *    `cleanModelUrl` already appends it when the URL does not match
  *    `.+/resolve/.+/`. Deriving it here would re-introduce exactly the
- *    duplication ARCHIVE.md records removing. The URL is passed through.
+ *    duplication STATUS.md records removing. The URL is passed through.
  */
 import { ERROR, EngineError } from "./errors.js";
 

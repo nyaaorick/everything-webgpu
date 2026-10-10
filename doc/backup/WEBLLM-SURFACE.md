@@ -43,7 +43,7 @@ literal in the tables below, plus:
   from that file's own source* and pinned to `PIPELINE_CONTRACT`, so neither can fall behind the code
 - `decode_tokens_per_s` still present in the bundle — `estimateSpeed()`'s measured path needs it
 - `model_lib` still unguessable from base + id — the "require it for a remote source" rule in
-  ROADMAP.md's verb-consolidation section depends on this staying true
+  STATUS.md's verb-consolidation section depends on this staying true
 
 A failure here is the dangerous kind: every symbol still resolves and behaviour changed anyway. Read
 it before touching anything else. `test/patches.test.mjs` and `test/integration.test.mjs` also run
@@ -75,9 +75,11 @@ bump — it is that you find out what broke in seconds and know exactly where to
 | `CreateWebWorkerMLCEngine` | `engine.js` | one engine per pool slot, each in its own realm |
 | `WebWorkerMLCEngineHandler` | `engine-worker.js` | the worker side of that |
 | `prebuiltAppConfig` | `engine.js` | 163 HuggingFace models, merged under our registry |
+| `functionCallingModelIds` | `engine.js` | which prebuilt models do tool calling — `listAvailableModels()` tags them, `recommendModels({ needsToolCalling })` filters on them. Shipped in the list; not derivable from an id |
 | `hasModelInCache` | `engine.cacheState()` | is a **remote/prebuilt** model on disk |
 | `deleteModelAllInfoInCache` | `engine.evict()` | delete a **remote/prebuilt** model's bytes |
 | `engine.chat.completions.create` | `pool.js` | the actual generation call |
+| `engine.embeddings.create` | `pool.js` | `embed()` / `embedRaw()`. The OpenAI-shaped namespace (`Embeddings.prototype.create`), not the bare `MLCEngine.embedding()` — one forward pass, routed through the same scheduler as a completion |
 | `usage.extra.decode_tokens_per_s` | `engine.#calibrate()` | measured throughput; calibrates projections |
 | `finish_reason` (`stop`/`length`/`abort`) | `pool.js`, `chat.js` | truncation vs. natural stop vs. interrupt |
 | `interruptGenerate()` | `pool.js` | cancellation and preemption |
@@ -90,9 +92,7 @@ bump — it is that you find out what broke in seconds and know exactly where to
 | Export | Why it matters |
 | --- | --- |
 | `CreateExtensionServiceWorkerMLCEngine` | **A native answer to the MV3 limit in AI.md.** Evaluate before hand-rolling a keep-alive. |
-| `engine.embedding()` / `Embeddings` | The 4 `snowflake-arctic-embed` models, from 239 MB. RAG and semantic search. |
 | `verifyIntegrity` / `isValidSRI` / `IntegrityError` | SRI checks on fetched artifacts — relevant once models are self-hosted. |
-| `functionCallingModelIds` | Which models do tool calling; belongs in model discovery. |
 | `reload([a, b])` + routing on `request.model` | Multiple models in **one** engine. See "Overlapping by design". |
 | `runtimeStatsText()` | Formatted prefill/decode stats. `usage.extra` is the structured form and is what we use. |
 | `getGPUVendor()`, `getMaxStorageBufferBindingSize()` | Overlap `probeDevice()` but need a **loaded** engine, so they cannot answer "will this load". |
@@ -120,7 +120,7 @@ as "not necessary in the way it was first presented", which was wrong: `reload()
 unconditionally before loading, so it is **all-or-nothing** — adding a third model to `{A, B}` reloads
 A and B too, ~51 s each on the 2B. There is no incremental residency upstream. Our `#pools:
 Map<modelId, EnginePool>` is the only thing that provides additive residency, which is a hard
-requirement (switching models must not cost re-downloading the ones already up). See ROADMAP.md,
+requirement (switching models must not cost re-downloading the ones already up). See STATUS.md,
 "Deferred", for the reopening condition.
 
 ## Removed, having been found redundant

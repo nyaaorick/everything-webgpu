@@ -1,6 +1,8 @@
 node_modules/
 vendor/
 *.xpi
+*.tgz
+artifacts/browser-debug/
 .DS_Store
 web-ext-artifacts/
 # Source checkpoints for in-house compilation (GBs).
@@ -10,3 +12,5 @@ dist/
 .venv-mlc/
 # Generated from JSDoc by `npm run types`.
 types/
+
+artifacts/responses-debug/

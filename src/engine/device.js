@@ -33,7 +33,7 @@ const PAGED_PREFILL_STORAGE_BUFFERS = 10;
  * @property {boolean} webgpu
  * @property {string} [reason] why WebGPU is unusable, when it is
  * @property {object} [adapter] vendor / architecture / device, where exposed
- * @property {{shaderF16: boolean}} [features]
+ * @property {{shaderF16: boolean, supported?: string[]}} [features]
  * @property {object} [limits]
  * @property {boolean} [kvReuse] whether cross-turn KV reuse can be used here
  * @property {{quota?: number, usage?: number, persisted?: boolean}} storage
@@ -47,6 +47,17 @@ const PAGED_PREFILL_STORAGE_BUFFERS = 10;
  * @returns {Promise<DeviceProbe>}
  */
 export async function probeDevice() {
+  let timer;
+  try {
+    return await Promise.race([readDeviceProbe(), new Promise((resolve) => {
+      timer = setTimeout(() => resolve({ webgpu: false, reason: 'WebGPU capability detection timed out after 10 seconds.', storage: {} }), 10000);
+    })]);
+  } catch (error) {
+    return { webgpu: false, reason: `WebGPU capability detection failed: ${error.message}`, storage: {} };
+  } finally { clearTimeout(timer); }
+}
+
+async function readDeviceProbe() {
   const storage = await probeStorage();
   const gpu = globalThis.navigator?.gpu;
 
@@ -89,7 +100,8 @@ export async function probeDevice() {
   return {
     webgpu: true,
     adapter: await adapterInfo(adapter),
-    features: { shaderF16: Boolean(adapter.features?.has?.("shader-f16")) },
+    features: { shaderF16: Boolean(adapter.features?.has?.("shader-f16")),
+      ...(adapter.features?.[Symbol.iterator] ? { supported: Array.from(adapter.features) } : {}) },
     limits,
     // Below 10 bindings the paged-prefill pipeline cannot be built, so every
     // turn re-prefills the whole history. See engine-worker.js.

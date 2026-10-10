@@ -39,7 +39,7 @@ import { PRIORITY } from "./constants.js";
  *
  * @param {import("./engine.js").ScheduledEngine} engine
  * @param {string | Array<{role: string, content: string}>} input
- * @param {object} [opts] anything `complete()` takes; `onDelta` to stream
+ * @param {Partial<import("./engine.js").CompletionRequest> & {onDelta?: (delta: string) => void}} [opts] anything `complete()` takes; `onDelta` to stream
  * @returns {Promise<string>} the reply text
  */
 export async function ask(engine, input, { onDelta, ...opts } = {}) {

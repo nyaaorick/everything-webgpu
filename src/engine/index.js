@@ -48,6 +48,7 @@
  */
 export { ScheduledEngine } from "./engine.js";
 export { CreateScheduledEngine } from "./create.js";
+export { createLocalClient } from "./local-client.js";
 export {
   canRun,
   probeDevice,
@@ -55,7 +56,7 @@ export {
   rankModels,
   REFERENCE_DECODE_BYTES_PER_SECOND,
 } from "./device.js";
-export { ERROR, EngineError, asEngineError, isEngineError } from "./errors.js";
+export { CAUSE, ERROR, EngineError, asEngineError, isEngineError } from "./errors.js";
 export { EnginePool } from "./pool.js";
 
 export {

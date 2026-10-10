@@ -67,6 +67,14 @@ export const MAX_DISPATCHES_PER_PASS = 1024;
 /** @type {Patch[]} */
 export const PATCHES = [
   {
+    id: "intentional-device-destruction",
+    why: "GPUDevice.destroy() is normal resource release. Its asynchronous lost notification must not unload a new model or report an OOM.",
+    edits: [{
+      before: "gpuDetectOutput.device.lost.then((info) => { if (this.deviceLostIsError) {",
+      after: "gpuDetectOutput.device.lost.then((info) => { if (this.deviceLostIsError && info.reason !== \"destroyed\") {",
+    }],
+  },
+  {
     id: "storage-buffer-limit",
     why:
       "tvmjs hardcodes a request for 10 storage buffers per shader stage; Firefox's Metal backend " +

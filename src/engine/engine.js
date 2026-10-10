@@ -15,10 +15,13 @@
  *
  *  - `store`      a ModelStore over a StorageAdapter, because
  *                 `browser.storage.local` does not exist in a page.
- *  - `workerUrl`  defaults to `new URL("./engine-worker.js", import.meta.url)`,
- *                 which Vite, webpack 5 and esbuild all understand and which
- *                 also resolves correctly on `moz-extension://`. It replaces
- *                 `browser.runtime.getURL` rather than sitting beside it.
+ *  - `workerUrl`  defaults to `new URL("../../vendor/worker.bundle.js",
+ *                 import.meta.url)`, which Vite, webpack 5 and esbuild all
+ *                 understand and which also resolves correctly on
+ *                 `moz-extension://`. It replaces `browser.runtime.getURL`
+ *                 rather than sitting beside it. The target is the *pre-bundled*
+ *                 worker — see `DEFAULT_WORKER_URL` for why it is not the source
+ *                 file next door.
  *  - `loadWebLLM` defaults to a static relative `import()`, so bundlers can see
  *                 it, and a host with its own patched build can override it.
  *                 It stays *dynamic* on purpose: the ~6 MB WebLLM bundle is
@@ -34,10 +37,11 @@ import { ENGINE_STATE, JOB_KIND, PRIORITY, UNLOAD_LEVEL, WORKER_CONFIGURE } from
 import { chatFacade } from "./chat.js";
 import { environmentFacade } from "./environment.js";
 import { canRun, probeDevice, projectSpeed, rankModels } from "./device.js";
-import { ERROR, EngineError, asEngineError } from "./errors.js";
+import { CAUSE, ERROR, EngineError, asEngineError } from "./errors.js";
 import { filesFromDataTransfer, filesFromInput, ingestModelFolder } from "./ingest.js";
 import { ModelStore, SOURCE, groupKeysByScope, isInjected, toAppConfig } from "./model-store.js";
 import { clampSteps } from "./multistep.js";
+import { createWorkerRuntime } from "./worker-runtime.js";
 import { EnginePool } from "./pool.js";
 import { prefetchModel } from "./prefetch.js";
 import { ask, conversation, ghostText } from "./recipes.js";
@@ -51,6 +55,7 @@ import { SOURCE_KIND, classifySource, isDataTransfer, isFileList, nearMatches } 
  * @property {string} [modelId] load this model first if it is not the live one
  * @property {string} [id] job id; also what `cancel(id)` takes
  * @property {number} [temperature]
+ * @property {number} [top_p]
  * @property {number} [max_tokens]
  * @property {object} [response_format]
  * @property {object} [extra_body]
@@ -74,7 +79,23 @@ import { SOURCE_KIND, classifySource, isDataTransfer, isFileList, nearMatches } 
  *   startedAt: number, finishedAt: number, error?: string}} BatchItem
  */
 
-const DEFAULT_WORKER_URL = () => new URL("./engine-worker.js", import.meta.url);
+/**
+ * The pre-bundled worker, not `./engine-worker.js` next door.
+ *
+ * The source worker is an ordinary module with three relative imports. Every
+ * bundler that *understands* `new Worker(new URL(…, import.meta.url))` rewrites
+ * them; Rollup, running a production `vite build` over a dependency it did not
+ * transform itself, does not — it copies the file through as an asset with the
+ * specifiers intact. They then 404 from `/assets/`, the worker dies before
+ * WebLLM's handshake, and the only symptom is `PACKAGE_INCOMPLETE` on a static
+ * host that worked perfectly in `vite dev`.
+ *
+ * `vendor/worker.bundle.js` has no imports at all, so copying it verbatim is
+ * the correct thing for a bundler to do and the failure has nowhere to live.
+ * It is a build product (`npm run build`, or `prepare` on install), which is
+ * why its absence is a `PACKAGE_INCOMPLETE` cause rather than a missing file.
+ */
+const DEFAULT_WORKER_URL = () => new URL("../../vendor/worker.bundle.js", import.meta.url);
 const DEFAULT_LOAD_WEBLLM = () => import("../../vendor/web-llm.js");
 
 /**
@@ -103,7 +124,7 @@ async function loadBundle(loadWebLLM) {
       "everything-webgpu is installed but its WebLLM bundle (vendor/web-llm.js) is missing. " +
         "That file is generated, not checked in — run `npm run build` in the package, " +
         "or reinstall so its `prepare` script runs.",
-      { cause: "vendor-bundle-missing", underlying: message },
+      { cause: CAUSE.VENDOR_BUNDLE_MISSING, underlying: message },
     );
   }
 }
@@ -116,6 +137,7 @@ export class ScheduledEngine {
   #chat = null;
   #environment = null;
   #probe = null;
+  #runtime;
   /** This machine's achieved decode bandwidth, learned from the first generation. */
   #decodeBytesPerSecond = 0;
   /** modelId -> weight bytes, for projections. */
@@ -159,12 +181,13 @@ export class ScheduledEngine {
    *   a ModelStore, or a bare StorageAdapter to wrap in one
    * @param {string | URL} [opts.workerUrl]
    * @param {() => Promise<object>} [opts.loadWebLLM]
+   * @param {any} [opts.runtime] Internal automatic-client policy and lifecycle hooks.
    * @param {boolean} [opts.prebuilt] expose WebLLM's 163 HuggingFace-hosted
    *   models, downloaded on first load. Default true. Set false for an
    *   offline-only build: `load()` then resolves registered models and nothing
    *   else, and an unknown id fails before the WebLLM bundle is even fetched.
    */
-  constructor({ store, workerUrl, loadWebLLM, prebuilt = true } = {}) {
+  constructor({ store, workerUrl, loadWebLLM, prebuilt = true, runtime = undefined } = {}) {
     if (!store) {
       throw new EngineError(ERROR.BAD_REQUEST, "ScheduledEngine needs a `store` (ModelStore or StorageAdapter).");
     }
@@ -176,6 +199,7 @@ export class ScheduledEngine {
     const load = loadWebLLM ?? DEFAULT_LOAD_WEBLLM;
     this.#loadWebLLM = () => loadBundle(load);
     this.#prebuilt = prebuilt;
+    this.#runtime = runtime;
   }
 
   /** The ModelStore, so a host can drive the registry without a second handle. */
@@ -304,6 +328,7 @@ export class ScheduledEngine {
    * @returns {Promise<import("./device.js").DeviceProbe>}
    */
   probe() {
+    if (this.#runtime?.probe) return Promise.resolve(this.#runtime.probe());
     this.#probe ??= probeDevice();
     return this.#probe;
   }
@@ -528,11 +553,24 @@ export class ScheduledEngine {
     const probe = await this.probe();
     const settings = await this.#store.getSettings();
     const pool = this.#pool?.status();
+    // The configured K, which is not the same question as whether bursts run.
+    // `decodeSteps` stays the knob's value even when the fast path is off: it is
+    // what `configure()` would be changing, and reporting 1 here would make
+    // `environment()` advise `configure({ decodeSteps: 15 })` for a fault that
+    // setting cannot fix.
+    const decodeSteps = this.#state.decode?.steps ?? settings.decodeSteps;
+    // Non-empty means the live pipeline failed the contract and decoding was
+    // routed to stock single-step. The worker keeps posting the *configured* K
+    // either way, so `steps > 1` cannot answer this — asking it alone reported
+    // a disabled fast path as healthy, which is the one case this call exists for.
+    const multiStepOff = this.#state.decode?.multiStepOff;
     return {
       kvReuse: Boolean(probe.kvReuse),
       shaderF16: Boolean(probe.features?.shaderF16),
-      decodeSteps: this.#state.decode?.steps ?? settings.decodeSteps,
-      multiStepDecoding: (this.#state.decode?.steps ?? settings.decodeSteps) > 1,
+      decodeSteps,
+      multiStepDecoding: decodeSteps > 1 && !multiStepOff?.length,
+      /** The missing tvmjs internals, or null when the fast path is intact. */
+      multiStepOff: multiStepOff?.length ? multiStepOff : null,
       engines: pool?.size ?? 0,
       maxEngines: pool?.maxSize ?? settings.engineCount,
       resident: this.resident,
@@ -718,6 +756,7 @@ export class ScheduledEngine {
       return this.#pools.has(modelId) ? this.use(modelId) : this.state;
     }
 
+    let abortLoading;
     const loading = (async () => {
       this.#assertWebGPU();
 
@@ -766,6 +805,10 @@ export class ScheduledEngine {
 
       const { CreateWebWorkerMLCEngine, prebuiltAppConfig } = await this.#loadWebLLM();
       const appConfig = toAppConfig(models, this.#prebuilt ? prebuiltAppConfig : null);
+      if (this.#runtime?.contextWindow) {
+        const entry = appConfig.model_list.find((m) => m.model_id === modelId);
+        if (entry) entry.overrides = { ...entry.overrides, context_window_size: this.#runtime.contextWindow };
+      }
 
       if (!appConfig.model_list.some((m) => m.model_id === modelId)) {
         // A typo'd id is the single most likely way to arrive here, and the
@@ -785,53 +828,30 @@ export class ScheduledEngine {
       const pool = new EnginePool({
         size: engineCount,
         createEngine: async (_index, onProgress) => {
-          const worker = new Worker(this.#workerUrl, { type: "module" });
-          // Listener, not `onmessage`: WebLLM claims `onmessage` for its own RPC.
-          worker.addEventListener("message", (event) => {
-            if (event.data?.ewgpuStats) this.#setState({ decode: event.data.ewgpuStats });
+          return createWorkerRuntime({
+            url: this.#workerUrl, signal, requireReady: Boolean(this.#runtime),
+            validate: this.#runtime?.validate,
+            onState: this.#runtime?.onState,
+            onFailure: (error) => {
+              this.#runtime?.onFailure?.(error);
+              this.#setState({ error: error.message, errorCode: error.code });
+            },
+            onProgress,
+            onMessage: (event) => {
+              if (event.data?.ewgpuStats) {
+                event.stopImmediatePropagation();
+                this.#setState({ decode: event.data.ewgpuStats });
+              }
+            },
+            initialize: async (worker, progress) => {
+              worker.postMessage({ kind: WORKER_CONFIGURE, decodeSteps });
+              const engine = await CreateWebWorkerMLCEngine(worker, modelId, {
+                appConfig, initProgressCallback: progress,
+              });
+              engine.configure = (patch) => worker.postMessage({ kind: WORKER_CONFIGURE, ...patch });
+              return engine;
+            },
           });
-          // A worker whose script 404s does not throw from `new Worker()` — it
-          // fires one `error` event and is then simply silent, so WebLLM's
-          // handshake below never resolves and the load hangs until the caller
-          // gives up. That is the exact shape of the Vite dep-optimizer bug this
-          // names: esbuild copies `new URL("./engine-worker.js",
-          // import.meta.url)` into `.vite/deps/` verbatim, where the sibling
-          // file does not exist. Racing the handshake against this turns a hang
-          // into a sentence.
-          const workerFailed = new Promise((_, reject) => {
-            worker.addEventListener("error", (event) => {
-              reject(
-                new EngineError(
-                  ERROR.PACKAGE_INCOMPLETE,
-                  `The decode worker failed to load from ${this.#workerUrl}. ` +
-                    "If you are on Vite, its dependency pre-bundler rewrote the worker URL to a " +
-                    "path that does not exist — add `optimizeDeps: { exclude: [\"everything-webgpu\"] }` " +
-                    "to vite.config.js, or pass `workerUrl` yourself.",
-                  { cause: "worker-unreachable", workerUrl: String(this.#workerUrl), underlying: event.message },
-                ),
-              );
-            });
-          });
-          // Sent before WebLLM's own handshake so the first token already decodes
-          // multi-step; worker message order guarantees it arrives first.
-          worker.postMessage({ kind: WORKER_CONFIGURE, decodeSteps });
-          const engine = await Promise.race([
-            CreateWebWorkerMLCEngine(worker, modelId, {
-              appConfig,
-              initProgressCallback: onProgress,
-            }),
-            workerFailed,
-          ]);
-          // The worker owns the decode loop, so runtime knobs go straight to it
-          // rather than through WebLLM's request path.
-          engine.configure = (patch) => worker.postMessage({ kind: WORKER_CONFIGURE, ...patch });
-          // Tear the realm down with the engine, not just the model.
-          const unloadEngine = engine.unload.bind(engine);
-          engine.unload = async () => {
-            await unloadEngine().catch(() => {});
-            worker.terminate();
-          };
-          return engine;
         },
         onStateChange: () => {
           if (this.#current === modelId) this.#syncState();
@@ -842,7 +862,8 @@ export class ScheduledEngine {
       // listener bumps the pool's generation, which is what stops an engine
       // that finishes building *after* the abort from installing itself.
       this.#loadingPools.set(modelId, pool);
-      if (signal) signal.addEventListener("abort", () => void this.#unloadOne(modelId), { once: true });
+      abortLoading = () => void this.#unloadOne(modelId);
+      signal?.addEventListener("abort", abortLoading, { once: true });
 
       const abortedNow = async () => {
         await this.#unloadOne(modelId);
@@ -885,6 +906,7 @@ export class ScheduledEngine {
       this.#syncState();
       throw engineError;
     } finally {
+      if (abortLoading) signal?.removeEventListener("abort", abortLoading);
       this.#loading.delete(modelId);
       this.#loadingPools.delete(modelId);
     }
@@ -935,7 +957,7 @@ export class ScheduledEngine {
 
   /** Unload every resident model. */
   async unloadAll() {
-    for (const id of [...this.#pools.keys()]) await this.#unloadOne(id);
+    for (const id of new Set([...this.#pools.keys(), ...this.#loadingPools.keys()])) await this.#unloadOne(id);
     this.#setState({ status: ENGINE_STATE.IDLE, progress: null, error: null });
     this.#syncState();
     return this.state;
@@ -1009,6 +1031,7 @@ export class ScheduledEngine {
     return {
       messages,
       temperature: payload.temperature ?? settings.temperature,
+      ...(payload.top_p != null ? { top_p: payload.top_p } : {}),
       max_tokens: payload.max_tokens ?? settings.maxTokens,
       ...(payload.response_format ? { response_format: payload.response_format } : {}),
       ...(payload.extra_body ? { extra_body: payload.extra_body } : {}),

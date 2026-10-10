@@ -134,7 +134,7 @@ test("a scoped anchor whose scope broke reports one problem, not two mysteries",
 test("the plan rewrites at verified offsets, back to front", () => {
   const { ok, plan } = verifyPatches(bundle);
   assert.ok(ok);
-  assert.equal(plan.length, 4);
+  assert.equal(plan.length, 5);
   for (let i = 1; i < plan.length; i++) {
     assert.ok(plan[i].start < plan[i - 1].start, "plan must be sorted descending");
     assert.ok(plan[i].end <= plan[i - 1].start, "edits must not overlap");

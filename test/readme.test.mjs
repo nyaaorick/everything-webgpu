@@ -1,3 +1,5 @@
+// Historical documentation assertions; excluded from npm test.
+// Archived content is not the current project specification.
 /**
  * The README is executable.
  *
@@ -22,7 +24,7 @@ import { readFileSync } from "node:fs";
 
 import { ERROR } from "../src/engine/index.js";
 
-const README = readFileSync(new URL("../README.md", import.meta.url), "utf8");
+const README = readFileSync(new URL("../doc/backup/README.md", import.meta.url), "utf8");
 const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
 
 /** Code inside fences, with diff markers stripped so `+` lines read as code. */

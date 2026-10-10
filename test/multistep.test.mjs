@@ -291,6 +291,20 @@ test("without kv_state_popn the cache is dropped rather than left corrupt", asyn
   assert.equal(pipeline.filledKVCacheLength, 0);
 });
 
+test("recurrent lookahead is reset without attempting an unsupported state rollback", async () => {
+  const pipeline = fakePipeline({ script: [1, 999, 3], stopTokens: [999] });
+  pipeline.rnnState = {};
+  const engine = fakeEngine();
+  installMultiStepDecoding(engine, { steps: 3 });
+  assert.deepEqual(await drain(engine, pipeline, {}), [1]);
+  assert.deepEqual(pipeline.device.popped, [], "no RNN popn call reaches the runtime");
+  assert.equal(pipeline.resetCalls, 1);
+  assert.equal(pipeline.filledKVCacheLength, 0);
+  await engine.prefill({}, pipeline, {}, {});
+  assert.equal(engine.calls.prefill, 1, "the next request can re-prefill normally");
+  assertNoLeaks(pipeline);
+});
+
 test("a new round discards lookahead left over from an interrupted one", async () => {
   const pipeline = fakePipeline({ script: [1, 2, 3, 4, 5] });
   const engine = fakeEngine();

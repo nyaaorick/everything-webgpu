@@ -37,7 +37,9 @@ npm i everything-webgpu
 
 `vendor/web-llm.js` — the patched WebLLM bundle the engine loads — is a **build product and is not
 checked in**, so every install route has to produce it. The published tarball ships it prebuilt;
-`prepare` regenerates it for a git dependency or a clone. If it is ever missing you get
+`prepare` regenerates it for a git dependency or a clone. `prepack` generates fresh TypeScript
+declarations, so `npm pack` works from a clean checkout without an earlier `npm run types`.
+If the runtime bundle is ever missing you get
 `PACKAGE_INCOMPLETE` naming the fix, rather than a module-resolution error pointing inside this
 package.
 
@@ -337,6 +339,8 @@ try {
 | `ABORTED` | The caller cancelled it. Not a failure; do not report it as one. |
 | `GENERATION_FAILED` | The model failed mid-generation. |
 | `PACKAGE_INCOMPLETE` | Your **build** is wrong, not your code — a missing `vendor/` bundle or a decode worker the bundler did not emit. `message` names the fix; `detail.cause` says which. |
+| `NO_ENGINE_HOST` | The engine lives in another context and that context is not running — an MV3 extension whose engine tab is closed. Recoverable: open it and retry. |
+| `TRANSPORT` | The message channel failed, not the model — a port that died mid-request, a payload that would not structured-clone. Retry the message; the model is fine. |
 
 ### Ask before you download, not after
 
@@ -441,7 +445,7 @@ its request or response shape is a major version. That is the whole point of the
 if it drifted, the line would not be one line.
 
 Everything else is pre-1.0 and may move. The ergonomic verbs (`load`, `unload`, `environment`) are
-being consolidated — see [ROADMAP.md](ROADMAP.md).
+being consolidated — see [STATUS.md](STATUS.md).
 
 ## Docs
 
@@ -450,20 +454,37 @@ being consolidated — see [ROADMAP.md](ROADMAP.md).
 | [API.md](API.md) | Every way to call it — one page, asserted against the code. |
 | [examples/](examples/) | Three runnable projects. Read one before reading the source. |
 | [AI.md](AI.md) | What is true and measured. The reference. |
-| [ROADMAP.md](ROADMAP.md) | The only list of open work. |
-| [ARCHIVE.md](ARCHIVE.md) | What was done and *why* — decisions with their reasoning. |
+| [STATUS.md](STATUS.md) | Open work, done work with its *why*, and how the model was compiled. |
 | [WEBLLM-SURFACE.md](WEBLLM-SURFACE.md) | What WebLLM already does, where our line is, and the dependency-bump runbook. |
-| [MLC-COMPILE.md](MLC-COMPILE.md) | How the model was compiled, and every toolchain breakage on the way. |
 
 ## Development
 
+<!-- AUTO-GENERATED: npm scripts — keep in sync with package.json (/ecc:update-docs) -->
+| Command | Description |
+| --- | --- |
+| `npm run build` | Bundle `@mlc-ai/web-llm` into `vendor/web-llm.js` and apply the two Firefox patches |
+| `npm run check` | Verify the build's entry points resolve (`build.mjs --check-entries`) |
+| `npm test` | Full GPU-free suite — contract, patches, README, examples, scheduler, multistep, API-doc, errors, device, … |
+| `npm run contract` | WebLLM-surface contract test only (`test/webllm-contract.test.mjs`) |
+| `npm run verify-patches` | Check the patch anchors without rebuilding |
+| `npm run types` | Type-check with `tsc -p tsconfig.json` |
+| `npm run e2e` | Real Firefox + real GPU + real model, end to end |
+| `npm run bench` | Standalone WebGPU submit/sync latency benchmark — no extension, no model |
+| `npm run package` | Build, then zip to `everything-webgpu.xpi` |
+| `npm run verify-consumer` | Pack clean source; verify installed exports, strict consumer types, Vite resources, and all example builds |
+| `npm run prepare` / `npm run prepack` / `npm run prepublishOnly` | Lifecycle hooks — build runtime bundles; generate types before packing; type-check + test before publish |
+<!-- END AUTO-GENERATED -->
+
+`verify-consumer` installs a real tarball in temporary projects, with no links back to the source
+checkout. It checks plain ESM imports without Vite, then Vite 6 development and production
+resource resolution and the bare, React, and WebExtension production builds. These are packaging
+checks; actual GPU inference is covered separately by `e2e`. To retain the verified tarball:
+
 ```sh
-npm run build            # bundle WebLLM + apply the two patches
-npm test                 # contract, patches, README, examples, scheduler, multistep — GPU-free
-npm run e2e              # real Firefox + real GPU + real model
-npm run verify-consumer  # pack + install for real; proves the Vite plugin is needed and works
-npm run verify-patches   # check patch anchors without rebuilding
+PACK_DESTINATION=artifacts/npm npm run verify-consumer
 ```
+
+Measurement knobs (env vars for `npm run e2e` / `npm run build`) are in [AI.md](AI.md#build-and-install).
 
 `@mlc-ai/web-llm` is pinned exactly, because the build rewrites its bundle at verified anchors.
 Bumping it is a documented, guarded procedure — see WEBLLM-SURFACE.md, "Upgrading".

@@ -285,6 +285,11 @@ cap), compute-pass batching (build-time `NO_PASS_MERGE`), `shader-f16`, GPU, `ab
 Every failure is an `EngineError` with a `.code`, a human-readable `.message` (the thing you print),
 and structured `.detail`. `import { isEngineError, ERROR } from "everything-webgpu"`.
 
+Two codes carry a second discriminator in `detail.cause`, whose values are the `CAUSE` map —
+`PACKAGE_INCOMPLETE` (`vendor-bundle-missing` · `worker-unreachable`) says which half of the build
+is wrong, and `NO_ENGINE_HOST` (`no-offscreen-api` · `no-tabs-api`) separates "open the engine tab"
+from "this browser has no API to open one". Compare against `CAUSE.*`, not a string literal.
+
 | code | what to do |
 | --- | --- |
 | `NO_WEBGPU` | tell the user to check flags/hardware; retrying is futile |
@@ -296,6 +301,8 @@ and structured `.detail`. `import { isEngineError, ERROR } from "everything-webg
 | `ABORTED` | the caller cancelled it. Not a failure; do not report it as one |
 | `GENERATION_FAILED` | the model failed mid-generation |
 | `PACKAGE_INCOMPLETE` | your **build** is wrong, not your code — missing `vendor/` bundle, or a decode worker the bundler did not emit. `message` names the fix; `detail.cause` says which |
+| `NO_ENGINE_HOST` | the engine lives in another context and that context is not running — an MV3 extension whose engine tab is closed. Recoverable: open it and retry |
+| `TRANSPORT` | the message channel failed, not the model — a port that died mid-request, a payload that would not structured-clone. Retry the message; the model is fine |
 
 ```js
 try { await engine.load(id); }
@@ -330,7 +337,7 @@ nothing.
 
 ## Every export
 
-`import { … } from "everything-webgpu"` — 43 names.
+`import { … } from "everything-webgpu"` — 44 names.
 
 **Engine & entry** — `ScheduledEngine`, `CreateScheduledEngine`, `EnginePool`
 
@@ -344,7 +351,7 @@ nothing.
 **Multi-step decoding** — `installMultiStepDecoding`, `burstSize`, `clampSteps`,
 `DEFAULT_DECODE_STEPS`, `MAX_DECODE_STEPS`
 
-**Errors** — `EngineError`, `ERROR`, `isEngineError`, `asEngineError`
+**Errors** — `EngineError`, `ERROR`, `CAUSE`, `isEngineError`, `asEngineError`
 
 **Formatting** — `formatBytes`
 
