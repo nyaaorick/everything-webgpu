@@ -21,11 +21,15 @@ integrate it. No server-side inference is part of the fallback requirement.
 
 ## Current state
 
-- npm release candidate: `everything-webgpu@0.1.3`, including bounded GPU uploads.
+- npm package: `everything-webgpu@0.1.3`, including bounded GPU uploads, submitted
+  successfully for the `latest` tag on 2026-10-11 using npm CLI 11.6.2 after
+  browser security-key verification. npm reports `Validating`; public `latest`
+  remains `0.1.1` and 0.1.3 is not yet installable.
   The prior 0.1.2 submission remains in automated review. `npm unpublish` reports
   success without cancelling unpublished review entries; withdrawal is not yet
   confirmed and requires an npm-supported cancellation path.
-  Registry publication status will be recorded after submission.
+  The package settings and version history expose no pending-review cancellation
+  control. Do not report 0.1.2 as withdrawn until npm confirms removal.
 - JavaScript ESM runtime, TypeScript declarations generated from JSDoc.
 - WebLLM `0.2.84`, bundled with verified patches, a self-contained worker,
   priority scheduling, model storage, and multi-step decoding.
