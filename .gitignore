@@ -14,3 +14,5 @@ dist/
 types/
 
 artifacts/responses-debug/
+artifacts/upload-baseline/
+artifacts/upload-batched/

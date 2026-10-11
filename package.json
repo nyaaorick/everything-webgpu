@@ -1,7 +1,7 @@
 {
   "name": "everything-webgpu",
-  "version": "0.1.1",
-  "description": "Firefox WebExtension and embeddable library that runs local MLC/WebLLM models on WebGPU, with a priority scheduler, multi-step decoding, and models from HuggingFace, your own URL, or injected straight from disk.",
+  "version": "0.1.3",
+  "description": "Local browser inference through the official OpenAI Responses SDK, using WebGPU with URL downloads or local MLC model imports.",
   "scripts": {
     "build": "node build.mjs",
     "check": "node build.mjs --check-entries",
@@ -73,7 +73,7 @@
     "vendor/web-llm.js",
     "vendor/worker.bundle.js",
     "vendor/worker-source.js",
-    "doc/backup/THIRD-PARTY-NOTICES.md",
-    "doc/roadmap.md"
+    "THIRD-PARTY-NOTICES.md",
+    "README.md"
   ]
 }

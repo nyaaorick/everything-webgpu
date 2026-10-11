@@ -14,16 +14,16 @@ import { existsSync, readFileSync } from "node:fs";
 
 const root = (p) => new URL(`../${p}`, import.meta.url);
 const pkg = JSON.parse(readFileSync(root("package.json"), "utf8"));
-const NOTICES = readFileSync(root("doc/backup/THIRD-PARTY-NOTICES.md"), "utf8");
+const NOTICES = readFileSync(root("THIRD-PARTY-NOTICES.md"), "utf8");
 
 test("the package ships its own LICENSE and the third-party notices", () => {
   assert.ok(existsSync(root("LICENSE")), "no LICENSE file");
-  assert.ok(existsSync(root("doc/backup/THIRD-PARTY-NOTICES.md")), "no doc/backup/THIRD-PARTY-NOTICES.md");
+  assert.ok(existsSync(root("THIRD-PARTY-NOTICES.md")), "no THIRD-PARTY-NOTICES.md");
 
-  // npm always ships LICENSE; doc/backup/THIRD-PARTY-NOTICES.md only ships if listed.
+  // npm always ships LICENSE; THIRD-PARTY-NOTICES.md only ships if listed.
   assert.ok(
-    pkg.files.includes("doc/backup/THIRD-PARTY-NOTICES.md"),
-    "doc/backup/THIRD-PARTY-NOTICES.md is not in package.json `files`, so it will not be published",
+    pkg.files.includes("THIRD-PARTY-NOTICES.md"),
+    "THIRD-PARTY-NOTICES.md is not in package.json `files`, so it will not be published",
   );
 
   // The declared license and the LICENSE file must agree.
@@ -46,7 +46,7 @@ test("every runtime dependency bundled into vendor/web-llm.js is in the notices"
   for (const [name, range] of Object.entries(bundled)) {
     assert.ok(
       NOTICES.includes(`## ${name} `),
-      `doc/backup/THIRD-PARTY-NOTICES.md has no section for bundled dependency "${name}"`,
+      `THIRD-PARTY-NOTICES.md has no section for bundled dependency "${name}"`,
     );
     const installed = JSON.parse(
       readFileSync(root(`node_modules/${name}/package.json`), "utf8"),

@@ -167,6 +167,7 @@ export class ScheduledEngine {
     status: ENGINE_STATE.IDLE,
     modelId: null,
     progress: null,
+    loadMetrics: null,
     error: null,
     pool: { size: 0, busy: 0, queued: 0 },
     /** Model ids with a live pool. `modelId` is whichever of them is current. */
@@ -794,6 +795,7 @@ export class ScheduledEngine {
         modelId,
         error: null,
         progress: { text: "Starting", progress: 0 },
+        loadMetrics: null,
       });
 
       // Each resident model is a full copy of its weights. Nothing reports free
@@ -875,7 +877,7 @@ export class ScheduledEngine {
       // abort during the download has already torn the pool down, and this is
       // what turns that into a rejection rather than a silent no-op.
       if (signal?.aborted) return abortedNow();
-      await pool.load((progress) => this.#setState({ progress }));
+      await pool.load((progress) => this.#setState({ progress, ...(progress.loadMetrics ? { loadMetrics: progress.loadMetrics } : {}) }));
       if (signal?.aborted) return abortedNow();
 
       const entry = appConfig.model_list.find((m) => m.model_id === modelId);

@@ -191,7 +191,7 @@ async function packageSpecifier() {
 // checkout must never hide missing packaging lifecycle steps. Build tools may
 // use the checkout's dependencies; the installed consumer below may not.
 mkdirSync(SOURCE);
-for (const path of ["package.json", "package-lock.json", "tsconfig.json", "build.mjs", "build", "src", "doc", "LICENSE"]) {
+for (const path of ["package.json", "package-lock.json", "tsconfig.json", "build.mjs", "build", "src", "doc", "README.md", "THIRD-PARTY-NOTICES.md", "LICENSE"]) {
   cpSync(join(ROOT, path), join(SOURCE, path), { recursive: true });
 }
 symlinkSync(join(ROOT, "node_modules"), join(SOURCE, "node_modules"), "dir");
@@ -235,11 +235,13 @@ for (const [subpath, entry] of Object.entries(manifest.exports)) {
     assert.ok(existsSync(join(installed, target)), `${subpath} promises missing file ${target}`);
   }
 }
-for (const path of [manifest.types, "doc/roadmap.md", "vendor/web-llm.js", "vendor/worker.bundle.js", "vendor/worker-source.js", "LICENSE", "doc/backup/THIRD-PARTY-NOTICES.md"]) {
+for (const path of [manifest.types, "README.md", "vendor/web-llm.js", "vendor/worker.bundle.js", "vendor/worker-source.js", "LICENSE", "THIRD-PARTY-NOTICES.md"]) {
   assert.ok(existsSync(join(installed, path)), `tarball is missing ${path}`);
 }
+assert.ok(!existsSync(join(installed, "doc")), "internal and archived documents must not ship in the npm package");
+assert.equal(readFileSync(join(installed, "README.md"), "utf8"), readFileSync(join(ROOT, "README.md"), "utf8"));
 assert.match(readFileSync(join(installed, "LICENSE"), "utf8"), /ISC/);
-const notices = readFileSync(join(installed, "doc/backup/THIRD-PARTY-NOTICES.md"), "utf8");
+const notices = readFileSync(join(installed, "THIRD-PARTY-NOTICES.md"), "utf8");
 assert.match(notices, /Apache License/);
 assert.match(notices, /Permission is hereby granted, free of charge/);
 

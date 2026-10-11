@@ -10,8 +10,9 @@ const ROOT = resolve(import.meta.dirname, "../..");
 const workPath = process.env.DEBUG_WORK ? resolve(process.env.DEBUG_WORK) : mkdtempSync(join(tmpdir(), "ewgpu-debug-"));
 mkdirSync(workPath, { recursive: true });
 const WORK = realpathSync(workPath);
-const responsesMode = process.env.RESPONSES === "1";
-const ARTIFACTS = join(ROOT, responsesMode ? "artifacts/responses-debug" : "artifacts/browser-debug");
+const uploadMode = process.env.UPLOAD_BENCH === "1";
+const responsesMode = process.env.RESPONSES === "1" || uploadMode;
+const ARTIFACTS = join(ROOT, uploadMode ? `artifacts/upload-${process.env.NO_UPLOAD_BATCHING ? "baseline" : "batched"}` : responsesMode ? "artifacts/responses-debug" : "artifacts/browser-debug");
 const MODEL = (process.env.MODEL_DIR ?? join(homedir(), "Downloads/Qwen3.5-0.8B-q4f16_1-MLC")).replace(/^~/, homedir());
 mkdirSync(WORK, { recursive: true });
 mkdirSync(ARTIFACTS, { recursive: true });
@@ -31,7 +32,7 @@ for (const name of runtimeFiles) runtimeHash.update(name).update(readFileSync(jo
 const candidate = { version: packageInfo.version, sdk: packageInfo.dependencies.openai,
   tarballSHA256: createHash("sha256").update(readFileSync(join(WORK, tgz))).digest("hex"),
   runtimeSHA256: runtimeHash.digest("hex") };
-copyFileSync(join(import.meta.dirname, responsesMode ? "responses-page.js" : "debug-page.js"), join(WORK, "debug-page.js"));
+copyFileSync(join(import.meta.dirname, uploadMode ? "upload-page.js" : responsesMode ? "responses-page.js" : "debug-page.js"), join(WORK, "debug-page.js"));
 writeFileSync(join(WORK, "index.html"), '<!doctype html><html lang="en"><meta charset="utf-8"><title>Everything WebGPU debug</title><body><h1>Edge / Firefox model verification</h1><pre style="white-space:pre-wrap"></pre><script type="module" src="/debug-page.js"></script></body></html>');
 const gguf = join(WORK, "stories260K.gguf");
 if (!responsesMode && !existsSync(gguf)) {
@@ -80,7 +81,7 @@ try {
       browser = await puppeteer.launch({
         browser: name === "firefox" ? "firefox" : "chrome", headless: false,
         executablePath: name === "firefox" ? "/Applications/Firefox.app/Contents/MacOS/firefox" : "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-        devtools: name === "edge", timeout: 60_000, protocolTimeout: 360_000,
+        devtools: name === "edge", timeout: 60_000, protocolTimeout: uploadMode ? 660_000 : 360_000,
         ...(name === "firefox" ? { extraPrefsFirefox: { "dom.webgpu.enabled": true, "gfx.webgpu.ignore-blocklist": true } } : {}),
       });
       report.version = await browser.version();
@@ -92,12 +93,12 @@ try {
       page.on("requestfailed", (req) => report.networkFailures.push({ url: req.url(), error: req.failure() }));
       page.on("response", (response) => { if (response.status() >= 400) report.networkFailures.push({ url: response.url(), status: response.status() }); });
       await page.goto("http://127.0.0.1:8789", { waitUntil: "networkidle0" });
-      await page.waitForFunction((mode) => typeof window[mode ? "runResponses" : "runGPU"] === "function", { timeout: 60_000 }, responsesMode);
-      for (const [field, method] of (responsesMode ? [["responses", "runResponses"]] : [["gpu", "runGPU"], ["noGPU", "runNoGPU"], ["cpu", "runCPU"]])) {
+      await page.waitForFunction((mode) => typeof window[mode === "upload" ? "runUploadBench" : mode ? "runResponses" : "runGPU"] === "function", { timeout: 60_000 }, uploadMode ? "upload" : responsesMode);
+      for (const [field, method] of (responsesMode ? [["responses", uploadMode ? "runUploadBench" : "runResponses"]] : [["gpu", "runGPU"], ["noGPU", "runNoGPU"], ["cpu", "runCPU"]])) {
         try {
           report[field] = await Promise.race([
             page.evaluate((method, args) => window[method](args), method, args),
-            new Promise((_, reject) => { const timer = setTimeout(() => reject(new Error(`${field} timed out after 5 minutes`)), 300_000); timer.unref(); }),
+            new Promise((_, reject) => { const timer = setTimeout(() => reject(new Error(`${field} timed out after ${uploadMode ? 10 : 5} minutes`)), uploadMode ? 600_000 : 300_000); timer.unref(); }),
           ]);
           report[field].status = "PASS";
         } catch (error) { report[field] = { status: "FAIL", error: error.stack ?? String(error) }; console.log(`${name} ${field}: FAIL ${error.message}`); }
