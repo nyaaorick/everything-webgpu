@@ -44,6 +44,7 @@
  */
 
 import { parse } from "acorn";
+import { loadGPUWeights } from "./upload-batch.mjs";
 
 /** Cap so one compute pass can never grow unbounded; 41/flush is the measured norm. */
 export const MAX_DISPATCHES_PER_PASS = 1024;
@@ -66,6 +67,35 @@ export const MAX_DISPATCHES_PER_PASS = 1024;
 
 /** @type {Patch[]} */
 export const PATCHES = [
+  {
+    id: "gpu-weight-upload-batching",
+    why: "Bound GPU weight uploads by 32 tensors and 32 MiB; retain TVM temporaries until each shard/batch completes. NO_UPLOAD_BATCHING=1 restores per-tensor waits.",
+    edits: [{
+      before: "fetchedBytes = 0; fetchedShards = 0; for (let i = 0; i < list.length; ++i) {",
+      after: `fetchedBytes = 0; fetchedShards = 0;
+        if (device.deviceType !== DeviceStrToEnum.cpu) {
+          yield (${loadGPUWeights.toString()})(this, list, device, artifactCache, tensorCacheUrl, signal,
+            (iter, bytes, stats) => { fetchedBytes = bytes; timeElapsed = Math.ceil((perf.now() - tstart) / 1e3); reportCallback(iter, true); },
+            ${process.env.NO_UPLOAD_BATCHING ? 1 : 32});
+          return;
+        }
+        for (let i = 0; i < list.length; ++i) {`,
+    }, {
+      before: "yield newPipeline.asyncLoadWebGPUPipelines();",
+      after: "const shaderStart = performance.now(); yield newPipeline.asyncLoadWebGPUPipelines(); if (tvm.ewgpuLoadMetrics) tvm.ewgpuLoadMetrics.shaderMs = performance.now() - shaderStart;",
+    }, {
+      before: 'const text = "Finish loading on " + gpuLabel; this.initProgressCallback({ progress: 1, timeElapsed: (tend - tstart) / 1e3, text });',
+      after: 'const text = "Finish loading on " + gpuLabel; this.initProgressCallback({ progress: 1, timeElapsed: (tend - tstart) / 1e3, text, loadMetrics: tvm.ewgpuLoadMetrics });',
+    }],
+  },
+  {
+    id: "intentional-device-destruction",
+    why: "GPUDevice.destroy() is normal resource release. Its asynchronous lost notification must not unload a new model or report an OOM.",
+    edits: [{
+      before: "gpuDetectOutput.device.lost.then((info) => { if (this.deviceLostIsError) {",
+      after: "gpuDetectOutput.device.lost.then((info) => { if (this.deviceLostIsError && info.reason !== \"destroyed\") {",
+    }],
+  },
   {
     id: "storage-buffer-limit",
     why:

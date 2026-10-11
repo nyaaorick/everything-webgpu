@@ -24,16 +24,24 @@ installCacheStorage();
  */
 const workers = [];
 globalThis.Worker = class {
-  #listeners = [];
+  #listeners = new Map();
   constructor() {
     workers.push(this);
   }
-  addEventListener(_type, fn) {
-    this.#listeners.push(fn);
+  addEventListener(type, fn) {
+    if (!this.#listeners.has(type)) this.#listeners.set(type, new Set());
+    this.#listeners.get(type).add(fn);
   }
+  removeEventListener(type, fn) { this.#listeners.get(type)?.delete(fn); }
   /** Stands in for the worker posting its decode probe. */
   emit(data) {
-    for (const fn of this.#listeners) fn({ data });
+    let stopped = false;
+    const event = { data, stopImmediatePropagation: () => { stopped = true; } };
+    for (const fn of this.#listeners.get("message") ?? []) {
+      fn(event);
+      if (stopped) break;
+    }
+    if (!stopped) this.onmessage?.(event);
   }
   postMessage() {}
   terminate() {}
@@ -45,6 +53,22 @@ const { SEVERITY } = await import("../src/engine/environment.js");
 const { memoryStorage } = await import("../src/adapters/memory.js");
 
 const MODEL = "Test-1B-q4f16_1-MLC";
+
+test("worker telemetry updates state without reaching WebLLM RPC; ordinary messages still arrive", async () => {
+  const { engine } = engineWith();
+  await engine.load(MODEL);
+  const worker = workers.at(-1);
+  const delivered = [];
+  worker.onmessage = (event) => delivered.push(event.data);
+  const stats = { steps: 15, tokens: 4 };
+  worker.emit({ ewgpuStats: stats });
+  assert.deepEqual(engine.state.decode, stats);
+  assert.deepEqual(delivered, []);
+  const response = { kind: "return", uuid: "rpc", content: "ok" };
+  worker.emit(response);
+  assert.deepEqual(delivered, [response]);
+  await engine.unload();
+});
 
 /** A device that works. Override `limits` to make it not. */
 const goodGpu = ({ buffers = 10, f16 = true } = {}) => ({
@@ -282,6 +306,36 @@ test("a silently disabled fast path is what the report is for", async () => {
   assert.equal(ms.severity, SEVERITY.DEGRADED, "a disabled fast path must not read as healthy");
   assert.match(ms.cause, /fsampleWithTopP/, "and must name what went missing");
   assert.match(ms.affects, /half throughput/);
+});
+
+test("features() agrees with the report about the fast path being off", async () => {
+  // The same fault, read through the other call. `features()` is documented as
+  // "what is switched on now", and it answered the question by asking whether
+  // the *configured* K exceeds 1 — which the worker keeps posting as 15 long
+  // after the contract check routed decoding to stock single-step. So the one
+  // call a consumer would use to check reported a dead fast path as healthy,
+  // and `environment()` only escaped it by reading `state.decode` itself.
+  const { engine } = engineWith();
+  workers.length = 0;
+  await engine.load(MODEL);
+
+  const healthy = await engine.features();
+  assert.equal(healthy.multiStepDecoding, true);
+  assert.equal(healthy.multiStepOff, null, "nothing missing while the path is intact");
+
+  workers.at(-1).emit({
+    ewgpuStats: { steps: 15, multiStepOff: ["fsampleWithTopP() is not a function"] },
+  });
+
+  const off = await engine.features();
+  assert.equal(off.multiStepDecoding, false, "the fast path is off, whatever K says");
+  assert.deepEqual(off.multiStepOff, ["fsampleWithTopP() is not a function"]);
+  assert.equal(
+    off.decodeSteps,
+    15,
+    "but the knob keeps its value — reporting 1 would make environment() advise " +
+      "configure({ decodeSteps: 15 }) for a fault that setting cannot fix",
+  );
 });
 
 test("measure() needs a resident model and says so", async () => {

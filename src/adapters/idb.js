@@ -9,7 +9,7 @@
  *
  * `persist()` is exported alongside because the page origin, unlike an
  * extension with `unlimitedStorage`, holds a multi-GB model in *evictable*
- * storage until persistence is granted. See ARCHIVE.md, "Zero-download".
+ * storage until persistence is granted. See STATUS.md, "Zero-download".
  */
 const DB_NAME = "everything-webgpu";
 const DB_VERSION = 1;
@@ -17,10 +17,19 @@ const STORE = "kv";
 
 function open() {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    let settled = false;
+    const finish = (error, db) => {
+      if (settled) { db?.close(); return; }
+      settled = true; clearTimeout(timer);
+      if (error) reject(error); else resolve(db);
+    };
+    const timer = setTimeout(() => finish(new Error('IndexedDB opening timed out. Close other tabs holding an older registry connection.')), 10000);
+    let req;
+    try { req = indexedDB.open(DB_NAME, DB_VERSION); }
+    catch (error) { finish(error); return; }
     req.onupgradeneeded = () => req.result.createObjectStore(STORE);
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
+    req.onsuccess = () => { req.result.onversionchange = () => req.result.close(); finish(null, req.result); };
+    req.onerror = () => finish(req.error);
   });
 }
 
@@ -45,6 +54,7 @@ const get1 = (store, key) =>
 export async function indexedDBStorage() {
   const db = await open();
   return {
+    close() { db.close(); },
     async get(key) {
       const keys = Array.isArray(key) ? key : [key];
       const out = {};

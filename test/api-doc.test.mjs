@@ -1,3 +1,5 @@
+// Historical documentation assertions; excluded from npm test.
+// Archived content is not the current project specification.
 /**
  * API.md is executable, like README.md.
  *
@@ -25,7 +27,7 @@ import { ScheduledEngine } from "../src/engine/index.js";
 import { ModelStore } from "../src/engine/model-store.js";
 import { memoryStorage } from "../src/adapters/memory.js";
 
-const DOC = readFileSync(new URL("../API.md", import.meta.url), "utf8");
+const DOC = readFileSync(new URL("../doc/backup/API.md", import.meta.url), "utf8");
 const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
 
 /** Members reachable on an engine instance — own, prototype, and getters. */
@@ -72,7 +74,7 @@ function section(heading) {
 test("the error table equals ERROR, both directions", () => {
   // Scoped to the Errors section — `| \`PRIORITY\` |` etc. in the enum table
   // would otherwise be read as error codes.
-  const inDoc = [...section("8\\. Errors").matchAll(/^\| `([A-Z_]+)` \|/gm)].map((m) => m[1]).sort();
+  const inDoc = [...section("Errors").matchAll(/^\| `([A-Z_]+)` \|/gm)].map((m) => m[1]).sort();
   assert.deepEqual(inDoc, Object.keys(pkgApi.ERROR).sort(), "API.md error table and ERROR diverge");
 });
 

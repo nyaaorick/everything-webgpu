@@ -75,9 +75,11 @@ test("ModelType still numbers LLM / embedding / VLM the same way", () => {
   assert.equal(webllm.ModelType.VLM, 2);
 });
 
-test("the embeddings API exists", () => {
-  // The embeddings item on the roadmap depends on this; asserting it now means
-  // the plan fails here rather than halfway through the implementation.
+test("the embeddings API keeps the shape `embed()` calls", () => {
+  // `pool.js` submits an EMBEDDING job through `engine.embeddings.create()` —
+  // the OpenAI-shaped namespace, not the bare `MLCEngine.embedding()`. A rename
+  // of either turns `embed()` / `embedRaw()` into a runtime throw with every
+  // symbol still resolving, which is the drift the contract exists to catch.
   assert.equal(typeof webllm.Embeddings.prototype.create, "function");
   assert.equal(typeof webllm.MLCEngine.prototype.embedding, "function");
 });

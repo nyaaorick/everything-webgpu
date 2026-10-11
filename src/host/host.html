@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Everything WebGPU — engine</title>
+    <style>
+      body {
+        font: 14px/1.55 system-ui, sans-serif;
+        margin: 0;
+        padding: 2.5rem;
+        color: #1a1a1a;
+        background: #fafafa;
+      }
+      @media (prefers-color-scheme: dark) {
+        body { color: #e8e8e8; background: #17171a; }
+      }
+      main { max-width: 34rem; }
+      h1 { font-size: 1.1rem; margin: 0 0 0.25rem; }
+      p { margin: 0.6rem 0; }
+      #state {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 0.9rem;
+      }
+      .warn {
+        margin-top: 1.5rem;
+        padding: 0.75rem 1rem;
+        border-left: 3px solid #c9821a;
+        background: #c9821a1a;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Everything WebGPU — engine</h1>
+      <p id="state">starting…</p>
+      <p class="warn">
+        <strong>Keep this tab open.</strong> The model lives here, in this tab's
+        memory. Closing it unloads the model and the next request has to load it
+        again. Manifest V3 removed the persistent background page that used to
+        hold it, so something visible has to.
+      </p>
+    </main>
+    <script type="module" src="host.js"></script>
+  </body>
+</html>

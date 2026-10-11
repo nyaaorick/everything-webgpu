@@ -12,14 +12,14 @@
  * Scheduling bands, highest first. `interactive` may preempt a running job that
  * opted into `preemptible`; nothing else ever interrupts work in flight.
  */
-export const PRIORITY = {
+export const PRIORITY = /** @type {const} */ ({
   /** Ghost-text and anything else a human is waiting on keystroke-by-keystroke. */
   INTERACTIVE: "interactive",
   /** Default. Translation, one-shot answers. */
   NORMAL: "normal",
   /** Nobody is watching: reformatting, batch cleanup. Pair with `preemptible`. */
   BACKGROUND: "background",
-};
+});
 
 export const PRIORITY_ORDER = [PRIORITY.INTERACTIVE, PRIORITY.NORMAL, PRIORITY.BACKGROUND];
 
@@ -66,3 +66,9 @@ export const ENGINE_STATE = {
  * on it without parsing the rest.
  */
 export const WORKER_CONFIGURE = "everything-webgpu/configure";
+
+/** Shared readiness envelope; never forwarded to WebLLM RPC. */
+export const WORKER_READY = 'everything-webgpu/ready';
+
+/** Version of the shared Worker readiness contract. */
+export const WORKER_PROTOCOL_VERSION = 1;

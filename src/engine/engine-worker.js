@@ -27,7 +27,8 @@
  * decoding is installed — the background page only ever holds a proxy.
  */
 import { WebWorkerMLCEngineHandler } from "../../vendor/web-llm.js";
-import { WORKER_CONFIGURE } from "./constants.js";
+import { WORKER_CONFIGURE, WORKER_READY, WORKER_PROTOCOL_VERSION } from "./constants.js";
+import { probeDevice } from "./device.js";
 import { DEFAULT_DECODE_STEPS, installMultiStepDecoding } from "./multistep.js";
 
 const handler = new WebWorkerMLCEngineHandler();
@@ -57,8 +58,7 @@ const resetStats = () => Object.keys(stats).forEach((k) => (stats[k] = 0));
  */
 let multiStepOff = null;
 
-// No `kind` field: WebLLM's client handler ignores messages it cannot classify
-// instead of throwing UnknownMessageKindError.
+// Consumed by ScheduledEngine's message listener before WebLLM's RPC handler.
 const postStats = () =>
   postMessage({ ewgpuStats: { ...stats, steps: multiStep.steps, multiStepOff } });
 
@@ -106,9 +106,10 @@ const multiStep = installMultiStepDecoding(handler.engine, {
 const PAGED_PREFILL_STORAGE_BUFFERS = 10;
 
 /** Whether this device is too tight to build that pipeline. Probed once. */
+const executionProbe = probeDevice();
 const kvReuseUnsafe = (async () => {
-  const adapter = await navigator.gpu?.requestAdapter().catch(() => null);
-  const limit = adapter?.limits?.maxStorageBuffersPerShaderStage ?? 0;
+  const probe = await executionProbe;
+  const limit = probe.limits?.maxStorageBuffersPerShaderStage ?? 0;
   const unsafe = limit < PAGED_PREFILL_STORAGE_BUFFERS;
   if (unsafe) {
     console.info(
@@ -140,3 +141,6 @@ self.onmessage = (msg) => {
   }
   handler.onmessage(msg);
 };
+
+// Confirm the execution realm before the host downloads model weights.
+executionProbe.then((capabilities) => postMessage({ kind: WORKER_READY, version: WORKER_PROTOCOL_VERSION, capabilities }));

@@ -15,7 +15,7 @@
  *
  * To fetch the artifacts ourselves we must know their URLs, which means
  * applying HuggingFace's `/resolve/main/` rule — the same rule
- * [ARCHIVE.md](../../ARCHIVE.md) records *removing* a copy of, and that §2a of
+ * [STATUS.md](../../STATUS.md) records *removing* a copy of, and that §2a of
  * the roadmap says not to derive at registration time.
  *
  * Those decisions still hold and this does not contradict them: they are about
@@ -42,7 +42,7 @@ import {
   LEGACY_TENSOR_MANIFEST,
   TENSOR_MANIFEST,
 } from "./ingest.js";
-import { CACHE_CONFIG, CACHE_MODEL, CACHE_WASM, isInjected } from "./model-store.js";
+import { CACHE_CONFIG, CACHE_MODEL, CACHE_WASM } from "./model-store.js";
 
 /**
  * WebLLM's `cleanModelUrl`, mirrored deliberately.
@@ -195,6 +195,3 @@ function parseJson(buffer, what, modelId) {
 }
 
 const basename = (url) => url.split("/").pop() || url;
-
-/** Only for injected models: they are in the cache before they are ever registered. */
-export const isAlreadyLocal = (record) => isInjected(record);

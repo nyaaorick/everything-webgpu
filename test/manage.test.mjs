@@ -402,3 +402,11 @@ test("an aborted load tears the in-flight pool down instead of orphaning it", as
     return true;
   });
 });
+
+test('a completed load releases its abort listener instead of detaching shutdown', async () => {
+  const e = engineWith(freshStore()), controller = new AbortController();
+  await e.load(A, { signal: controller.signal });
+  controller.abort();
+  assert.deepEqual(e.resident, [A], 'load signal must not unload a ready engine in the background');
+  await e.unloadAll(); assert.deepEqual(e.resident, []);
+});

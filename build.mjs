@@ -10,9 +10,10 @@
  *   node build.mjs --minify        same, minified
  *   node build.mjs --zip           produce an installable .xpi
  */
+import { parse } from "acorn";
 import { build } from "esbuild";
 import { execFile } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { promisify } from "node:util";
 
 import { PATCHES, explainFailures, verifyPatches } from "./build/patches.mjs";
@@ -20,6 +21,7 @@ import { PATCHES, explainFailures, verifyPatches } from "./build/patches.mjs";
 const flag = (name) => process.argv.includes(name);
 
 const BUNDLE = "vendor/web-llm.js";
+const WORKER_BUNDLE = "vendor/worker.bundle.js";
 const MANIFEST = "build/patch-manifest.json";
 
 // `--verify-patches` is read-only: it must not rewrite vendor/ as a side effect.
@@ -46,6 +48,11 @@ if (!flag("--check-entries") && !flag("--zip") && !flag("--verify-patches")) {
     logLevel: "info",
   });
   applyPatches();
+  // After the patches, never before: the worker inlines this bundle, so an
+  // unpatched copy would ship a worker running stock tvmjs while the main
+  // thread ran the patched one — the two would disagree about storage-buffer
+  // limits and compute-pass batching with nothing to indicate it.
+  await buildWorkerBundle();
 }
 
 /**
@@ -114,6 +121,93 @@ function applyPatches() {
 }
 
 /**
+ * The decode worker, flattened to a file that imports nothing.
+ *
+ * `src/engine/engine-worker.js` is an ordinary ES module with three relative
+ * imports (`../../vendor/web-llm.js`, `./constants.js`, `./multistep.js`).
+ * Shipping it as the worker entry works everywhere the package is served as
+ * source, and breaks in exactly one place that matters — a **production**
+ * `vite build`. Rollup does not recognise `new Worker(new URL(…))` inside a
+ * dependency it did not itself transform, so it emits the file as an *asset*:
+ * copied byte-for-byte, imports unrewritten. Landed on a static host at
+ * `/assets/engine-worker-<hash>.js`, all three specifiers 404, the worker dies
+ * before WebLLM's handshake, and `load()` throws `PACKAGE_INCOMPLETE`.
+ *
+ * Measured, not assumed: the chunk `examples/bare` emitted was 6126 bytes —
+ * byte-identical to the source, `import { WebWorkerMLCEngineHandler } from
+ * "../../vendor/web-llm.js"` still on line 29.
+ *
+ * A worker with no imports cannot be broken this way, because copying it
+ * verbatim is then the *correct* thing for a bundler to do. That is the whole
+ * fix; it costs a second inlined copy of WebLLM, which is not a duplicate in
+ * any meaningful sense — a worker is a separate realm and could never have
+ * shared the main thread's chunk.
+ *
+ * Why `vendor/` and not `dist/`: `dist/` is where the in-house MLC model build
+ * writes gigabytes of weights (see STATUS.md, Part 3). `vendor/` is already the
+ * directory that means "build product, gitignored, shipped via `files`".
+ */
+async function buildWorkerBundle() {
+  await build({
+    entryPoints: ["src/engine/engine-worker.js"],
+    outfile: WORKER_BUNDLE,
+    bundle: true,
+    format: "esm",
+    platform: "browser",
+    target: ["firefox115"],
+    // Same reasoning as the WebLLM bundle above: this file is redistributed in
+    // the tarball and now contains all of WebLLM, so its notices must survive.
+    legalComments: "eof",
+    minify: flag("--minify"),
+    logLevel: "info",
+  });
+
+  // The guarantee is structural — `bundle: true` with no `external` cannot
+  // leave an import behind — but the whole defect was a file that *looked*
+  // bundled and was not, so it is asserted against the shipped bytes rather
+  // than trusted from the config. An `external` added here later fails loudly.
+  const leftover = residualImports(readFileSync(WORKER_BUNDLE, "utf8"));
+  if (leftover.length) {
+    throw new Error(
+      `${WORKER_BUNDLE} still imports ${leftover.map((s) => `"${s}"`).join(", ")}.\n` +
+        "  A worker entry with imports is the PACKAGE_INCOMPLETE defect: Rollup copies it\n" +
+        "  as an asset without rewriting them. Remove the `external` that caused this.\n",
+    );
+  }
+  const kb = (statSync(WORKER_BUNDLE).size / 1024).toFixed(0);
+  // A module containing the worker bytes survives dependency prebundling.
+  // The local client creates an owned Blob URL instead of guessing asset paths.
+  writeFileSync("vendor/worker-source.js", `export default ${JSON.stringify(readFileSync(WORKER_BUNDLE, "utf8"))};\n`);
+  console.log(`wrote ${WORKER_BUNDLE} (${kb} kB, 0 imports)`);
+}
+
+/**
+ * Every module specifier the source still reaches for at load time.
+ *
+ * Static `import`s and dynamic `import("…")` of a literal both count; a dynamic
+ * import of a computed expression does not, because it cannot be a relative
+ * sibling path resolved against `import.meta.url` — which is the only shape
+ * that breaks.
+ */
+function residualImports(source) {
+  const found = [];
+  const walk = (node) => {
+    if (!node || typeof node !== "object") return;
+    if (Array.isArray(node)) return node.forEach(walk);
+    if (node.type === "ImportDeclaration" || node.type === "ExportAllDeclaration") {
+      if (node.source) found.push(node.source.value);
+    }
+    if (node.type === "ExportNamedDeclaration" && node.source) found.push(node.source.value);
+    if (node.type === "ImportExpression" && node.source?.type === "Literal") {
+      found.push(node.source.value);
+    }
+    for (const key of Object.keys(node)) if (key !== "type") walk(node[key]);
+  };
+  walk(parse(source, { ecmaVersion: "latest", sourceType: "module" }));
+  return found;
+}
+
+/**
  * Both rewrites, and the reasoning behind each, live in
  * [build/patches.mjs](build/patches.mjs) as data rather than as a pair of
  * functions that each hand-rolled its own anchor check. `npm run verify-patches`
@@ -165,6 +259,10 @@ if (flag("--check-entries")) {
       "src/adapters/idb.js",
       "src/adapters/memory.js",
       "src/background/background.js",
+      // The MV3 pair, checked even though manifest.json is still MV2 — a broken
+      // import here would otherwise surface only at the manifest flip.
+      "src/background/relay.js",
+      "src/host/host.js",
       "src/popup/popup.js",
       "src/manager/manager.js",
     ],

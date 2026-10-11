@@ -168,6 +168,7 @@ function toModelListEntry(record) {
     model: record.model,
     model_id: record.model_id,
     model_lib: record.model_lib,
+    ...(record.required_features ? { required_features: record.required_features } : {}),
     // Carried through, or WebLLM treats a locally registered VLM as text-only.
     ...(record.model_type !== undefined ? { model_type: record.model_type } : {}),
     ...(record.overrides ? { overrides: record.overrides } : {}),
@@ -204,6 +205,7 @@ export function formatBytes(bytes) {
  * @typedef {object} StorageAdapter
  * @property {(key: string | string[]) => Promise<object>} get
  * @property {(items: object) => Promise<void>} set
+ * @property {() => void} [close] Release an owned adapter connection.
  *
  * Two methods, deliberately the exact shape of `browser.storage.local`, so the
  * WebExtension adapter is a passthrough rather than a translation layer. See

@@ -1,4 +1,12 @@
-/** TEMPORARY: benchmarks the hidden background page, then opens the self-test tab. */
+/**
+ * TEMPORARY: benchmarks the context the engine actually runs in, then opens the
+ * self-test tab.
+ *
+ * That context used to be the hidden MV2 background page. Under MV3 it is the
+ * engine host tab — the background is an event page that owns no engine and may
+ * not even be alive. Benching the wrong one would still produce a number, which
+ * is why the label below travels in the report rather than sitting in a comment.
+ */
 import { gpuBench } from "./gpubench.js";
 
 const SERVER = "http://127.0.0.1:8787";
@@ -19,7 +27,7 @@ const SERVER = "http://127.0.0.1:8787";
       await fetch(`${SERVER}/report`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ kind: "bench", where: "background page (hidden)", bench }),
+        body: JSON.stringify({ kind: "bench", where: "engine host tab", bench }),
       });
     }
   } catch (err) {

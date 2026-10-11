@@ -24,6 +24,7 @@ import assert from "node:assert/strict";
 import { build } from "esbuild";
 
 import { verifyPatches } from "../build/patches.mjs";
+import { loadGPUWeights } from "../build/upload-batch.mjs";
 
 const bundle = (
   await build({
@@ -134,7 +135,7 @@ test("a scoped anchor whose scope broke reports one problem, not two mysteries",
 test("the plan rewrites at verified offsets, back to front", () => {
   const { ok, plan } = verifyPatches(bundle);
   assert.ok(ok);
-  assert.equal(plan.length, 4);
+  assert.equal(plan.length, 8);
   for (let i = 1; i < plan.length; i++) {
     assert.ok(plan[i].start < plan[i - 1].start, "plan must be sorted descending");
     assert.ok(plan[i].end <= plan[i - 1].start, "edits must not overlap");
@@ -147,4 +148,54 @@ test("the plan rewrites at verified offsets, back to front", () => {
   }
   assert.ok(patched.includes("this.pendingComputePass.end();"));
   assert.ok(!patched.includes(COMPUTE_END));
+});
+
+function uploadFixture(sizes, options = {}) {
+  const live = new Set(), registered = [], waits = [];
+  let copies = 0;
+  const runtime = {
+    env: { logger() {} }, cpu: () => 'cpu', withNewScope: (f) => f(), detachFromCurrentScope: (x) => x,
+    empty(shape, dtype, device) {
+      const tensor = { shape, dlDataType: { numStorageBytes: () => 1 }, device,
+        copyFrom(cpu) { assert.ok(live.has(cpu)); if (options.copyError) throw new Error('copy failure'); copies++; },
+        dispose() { assert.ok(live.delete(tensor), 'temporary disposed exactly once'); } };
+      live.add(tensor); return tensor;
+    },
+    ctx: { arrayDecodeStorage() { if (options.decodeError) throw new Error('decode failure'); } },
+    tensorCacheUpdate(name, gpu) { assert.ok(live.has(gpu)); if (options.registerError) throw new Error('register failure'); registered.push(name); },
+  };
+  const device = { async sync() { waits.push([...live].filter((x) => x.device !== 'cpu').length); if (options.syncError) throw new Error('sync failure'); options.onSync?.(); } };
+  const list = sizes.map((shard) => ({ dataPath: 'shard', nbytes: 1, records: shard.map((size, i) => ({ name: String(i), shape: [size], dtype: 'uint8', byteOffset: 0, nbytes: 1 })) }));
+  return { live, registered, waits, runtime, device, list, cache: { async fetchWithCache() { return new ArrayBuffer(1); } } };
+}
+async function runUpload(f, signal, limit = 32) {
+  return loadGPUWeights(f.runtime, f.list, f.device, f.cache, 'https://example.test/', signal, () => {}, limit);
+}
+test('upload batches respect tensor/decoded byte bounds, oversized singletons and shard boundaries', async () => {
+  const MiB = 1024 * 1024;
+  const f = uploadFixture([Array(65).fill(4), [20 * MiB, 20 * MiB, 40 * MiB, 4], []]);
+  const stats = await runUpload(f);
+  assert.equal(stats.barriers, 7);
+  assert.deepEqual(f.waits, [32, 32, 1, 1, 1, 1, 1]);
+  assert.equal(stats.tensors, 69);
+  assert.equal(stats.bytes, 80 * MiB + 264);
+  assert.equal(f.live.size, 0);
+  assert.equal(f.registered.length, 69);
+});
+test('upload failures and cancellation release all temporaries without registration', async () => {
+  for (const options of [{ decodeError: true }, { copyError: true }, { syncError: true }, { registerError: true }]) {
+    const f = uploadFixture([[4]], options);
+    await assert.rejects(runUpload(f), /failure/);
+    assert.equal(f.live.size, 0); assert.equal(f.registered.length, 0);
+  }
+  const controller = new AbortController();
+  const f = uploadFixture([[4]], { onSync: () => controller.abort() });
+  await assert.rejects(runUpload(f, controller.signal), { name: 'AbortError' });
+  assert.equal(f.live.size, 0); assert.equal(f.registered.length, 0);
+});
+test('rollback uses one barrier per tensor and empty models use none', async () => {
+  const f = uploadFixture([[4, 4, 4]]);
+  f.device.sync = async () => { f.waits.push(1); };
+  assert.equal((await runUpload(f, undefined, 1)).barriers, 3);
+  assert.equal((await runUpload(uploadFixture([[]]))).barriers, 0);
 });

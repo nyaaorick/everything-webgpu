@@ -249,7 +249,7 @@ test("a URL loads through registration, with modelLib required", async () => {
 });
 
 test("`/resolve/main/` is never derived — WebLLM's cleanModelUrl owns that", async () => {
-  // Deriving it here would re-introduce the duplication ARCHIVE.md records
+  // Deriving it here would re-introduce the duplication STATUS.md records
   // removing, and would double up on a URL that already carries it.
   const store = freshStore();
   const { engine } = engineWith(store, { prebuilt: false });

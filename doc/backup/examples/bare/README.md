@@ -1,7 +1,7 @@
 # bare — Vite, vanilla JS
 
 The smallest thing that proves the library works outside an extension: one HTML
-page, one `main.js`, no framework. This is **Gate A** from [ROADMAP.md](../../ROADMAP.md).
+page, one `main.js`, no framework. This is **Gate A** from [STATUS.md](../../STATUS.md).
 
 ```sh
 npm install
