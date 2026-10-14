@@ -1,5 +1,6 @@
+import { createStructuredOutput } from './structured-output.js';
 import { ERROR, EngineError } from './errors.js';
-/** Local Responses transport. Contract reference: openai@6.49.0, 2026-10-11. */
+/** Local Responses transport. Contract reference: openai@6.49.0, 2026-10-15. */
 const clone = (value) => structuredClone(value);
 const uid = (prefix) => `${prefix}_${crypto.randomUUID().replaceAll('-', '')}`;
 const terminal = (r) => !['queued', 'in_progress'].includes(r.status);
@@ -54,7 +55,6 @@ function validate(body) {
   if (body.include != null && (!Array.isArray(body.include) || body.include.length)) bad('Additional include fields are not supported.', 'include', 'unsupported_parameter');
   if (body.tools != null && (!Array.isArray(body.tools) || body.tools.length)) bad('Tools are not supported by this local Responses backend yet.', 'tools', 'unsupported_parameter');
   if (body.tool_choice != null && !['auto', 'none'].includes(body.tool_choice)) bad('Unsupported tool_choice.', 'tool_choice', 'unsupported_parameter');
-  if (body.text != null && (typeof body.text !== 'object' || Array.isArray(body.text) || Object.keys(body.text).some((k) => k !== 'format') || (body.text.format != null && (typeof body.text.format !== 'object' || Array.isArray(body.text.format))) || Object.keys(body.text.format ?? {}).some((k) => k !== 'type') || (body.text.format?.type ?? 'text') !== 'text')) bad('Only plain text format is supported.', 'text', 'unsupported_parameter');
   if (body.metadata != null && (typeof body.metadata !== 'object' || Array.isArray(body.metadata) || Object.keys(body.metadata).length > 16 || Object.entries(body.metadata).some(([k,v]) => k.length > 64 || typeof v !== 'string' || v.length > 512))) bad('Invalid metadata.', 'metadata');
 }
 
@@ -63,6 +63,7 @@ function validate(body) {
  * @returns {{fetch: typeof fetch, close: () => Promise<void>, readonly activeCount: number}}
  */
 export function createResponsesTransport({ getEngine, maxStored = 128, modelId }) {
+  const structured = createStructuredOutput();
   const records = new Map();
   const active = new Set();
   let closed = false;
@@ -85,6 +86,8 @@ export function createResponsesTransport({ getEngine, maxStored = 128, modelId }
   }
   function make(body) {
     validate(body);
+    const outputFormat = structured.prepare(body.text, bad);
+    body = clone(body);
     if (modelId && body.model !== modelId) throw new RequestError(`Model ${body.model} is not configured.`, 'model', 404, 'model_not_found');
     if (active.size >= 32) throw new RequestError('Too many active local responses.', null, 429, 'local_queue_full');
     const input = normalize(body.input ?? []);
@@ -100,7 +103,7 @@ export function createResponsesTransport({ getEngine, maxStored = 128, modelId }
       // Never evict silently: previously returned IDs retain their promised lifetime.
       if (records.size >= maxStored) throw new RequestError('Local response storage is full. Delete responses or use store=false.', 'store', 429, 'local_storage_full');
     }
-    const record = { body, input: combined, history: combined, events: [], listeners: new Set(),
+    const record = { body, outputFormat, input: combined, history: combined, events: [], listeners: new Set(),
       controller: new AbortController(), jobId: uid('job'), cancelled: false, engine: null, response: {
         id: uid('resp'), object: 'response', created_at: Math.floor(Date.now()/1000),
         status: body.background ? 'queued' : 'in_progress', background: body.background ?? false,
@@ -109,7 +112,7 @@ export function createResponsesTransport({ getEngine, maxStored = 128, modelId }
         output: [], parallel_tool_calls: body.parallel_tool_calls ?? true,
         previous_response_id: body.previous_response_id ?? null, reasoning: null,
         temperature: body.temperature ?? 1,
-        text: { format: { type: 'text' } }, tool_choice: body.tool_choice ?? 'auto', tools: [],
+        text: { format: clone(outputFormat.format) }, tool_choice: body.tool_choice ?? 'auto', tools: [],
         top_p: body.top_p ?? 1, truncation: 'disabled', usage: null,
       } };
     if (body.store !== false) records.set(record.response.id, record);
@@ -138,6 +141,7 @@ export function createResponsesTransport({ getEngine, maxStored = 128, modelId }
       if (record.body.instructions != null) messages.unshift({ role: 'system', content: record.body.instructions });
       const result = await record.engine.completeRaw({ id: record.jobId, modelId: r.model, messages,
         temperature: r.temperature, top_p: r.top_p, max_tokens: r.max_output_tokens ?? 1024,
+        ...(record.outputFormat.backend ? { response_format: record.outputFormat.backend } : {}),
         task: record.jobId, priority: record.body.background ? 'background' : 'normal' }, (chunk) => {
         if (record.cancelled) return;
         const delta = chunk.choices?.[0]?.delta?.content;
@@ -149,6 +153,7 @@ export function createResponsesTransport({ getEngine, maxStored = 128, modelId }
       if (record.cancelled || result.cancelled || result.preempted || result.finishReason === 'abort') throw abortError();
       if (result.toolCalls?.length) throw new EngineError(ERROR.GENERATION_FAILED, 'Unexpected tool output from a text-only request.');
       if (part.text !== result.text) throw new EngineError(ERROR.GENERATION_FAILED, 'Backend streaming output did not match its final text.');
+      if (result.finishReason !== 'length') structured.validate(record.outputFormat, part.text);
       r.status = result.finishReason === 'length' ? 'incomplete' : 'completed';
       item.status = r.status === 'incomplete' ? 'incomplete' : 'completed';
       if (r.status === 'completed') r.completed_at = Math.floor(Date.now()/1000);
@@ -176,6 +181,8 @@ export function createResponsesTransport({ getEngine, maxStored = 128, modelId }
       // cancellation is observed through retrieve/cancel; end the SSE cleanly.
       if (r.status !== 'cancelled') emit(record, 'response.failed', { response: snapshot(record) });
     } finally {
+      // Stored responses retain wire data, not evicted validator instances.
+      record.outputFormat.validator = undefined;
       active.delete(record);
       for (const wake of record.listeners) wake();
     }
@@ -279,5 +286,5 @@ export function createResponsesTransport({ getEngine, maxStored = 128, modelId }
         param: error.param ?? null, code: error.code ?? 'server_error' } }, error.status ?? 500);
     }
   };
-  return { fetch: localFetch, get activeCount() { return active.size; }, async close() { closed = true; for (const record of active) stop(record); await Promise.allSettled([...active].map((r) => r.promise)); records.clear(); } };
+  return { fetch: localFetch, get activeCount() { return active.size; }, async close() { closed = true; for (const record of active) stop(record); await Promise.allSettled([...active].map((r) => r.promise)); records.clear(); structured.clear(); } };
 }

@@ -142,16 +142,19 @@ export function createLocalClient(model, options = {}) {
       const cancelledAt = new Map();
       engine.cancel = (id) => { cancelledAt.set(id, performance.now()); return cancel(id); };
       engine.completeRaw = async (request, onChunk) => {
-        const start = performance.now(); let first = null;
+        const start = performance.now(); let first = null, result;
         try {
-          return await complete(request, (chunk) => {
+          result = await complete(request, (chunk) => {
             if (first == null && chunk.choices?.[0]?.delta?.content) first = performance.now() - start;
             onChunk?.(chunk);
           });
+          return result;
         } finally {
           const aborted = cancelledAt.get(request.id);
           measurements = { durationMs: performance.now() - start, firstTokenMs: first,
-            cancellationMs: aborted == null ? null : performance.now() - aborted };
+            cancellationMs: aborted == null ? null : performance.now() - aborted,
+            grammarInitMs: result?.usage?.extra?.grammar_init_s == null ? null : result.usage.extra.grammar_init_s * 1000,
+            decodeTokensPerSecond: result?.usage?.extra?.decode_tokens_per_s ?? null };
           cancelledAt.delete(request.id);
         }
       };

@@ -68,6 +68,40 @@ export const MAX_DISPATCHES_PER_PASS = 1024;
 /** @type {Patch[]} */
 export const PATCHES = [
   {
+    id: "structured-output-grammar",
+    why: "Plain JSON needs the builtin grammar; compiler errors must reject, and compiler caching must be bounded; bound grammar whitespace to prevent whitespace-only stalls. Reuse only the current matcher.",
+    edits: [
+      {
+        before: "this.grammarMatcher = yield libExports$1.GrammarMatcher.createGrammarMatcher(grammar); grammar.dispose();",
+        after: "try { this.grammarMatcher = yield libExports$1.GrammarMatcher.createGrammarMatcher(grammar); } finally { grammar.dispose(); }",
+      },
+      {
+        before: "this.grammarCompiler.compileJSONSchema(responseFormat.schema)",
+        after: "this.grammarCompiler.compileJSONSchema(responseFormat.schema, true, 2, void 0, true, 2)",
+      },
+      {
+        before: "grammarMatcherInitPromise = new Promise((resolve) => __awaiter(this, void 0, void 0, function* () {",
+        after: "grammarMatcherInitPromise = __awaiter(this, void 0, void 0, function* () {",
+      },
+      {
+        before: "this.curRoundGrammarInitTotalTime = (performance.now() - tGrammarInitStart) / 1e3; resolve(); }));",
+        after: "this.curRoundGrammarInitTotalTime = (performance.now() - tGrammarInitStart) / 1e3; });",
+      },
+      {
+        before: "responseFormat.type === void 0 ? yield this.grammarCompiler.compileBuiltinJSONGrammar()",
+        after: 'responseFormat.type === "json_object" && responseFormat.schema == null ? yield this.grammarCompiler.compileBuiltinJSONGrammar()',
+      },
+      {
+        before: "GrammarCompiler.createGrammarCompiler(this.xgTokenizerInfo)",
+        after: "GrammarCompiler.createGrammarCompiler(this.xgTokenizerInfo, false)",
+      },
+      {
+        before: "this.grammarMatcher.dispose(); } if (this.xgTokenizerInfo === void 0)",
+        after: "this.grammarMatcher.dispose(); this.grammarMatcher = void 0; this.responseFormatCacheKey = void 0; } if (this.xgTokenizerInfo === void 0)",
+      },
+    ],
+  },
+  {
     id: "gpu-weight-upload-batching",
     why: "Bound GPU weight uploads by 32 tensors and 32 MiB; retain TVM temporaries until each shard/batch completes. NO_UPLOAD_BATCHING=1 restores per-tensor waits.",
     edits: [{

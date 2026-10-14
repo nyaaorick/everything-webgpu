@@ -51,7 +51,7 @@ integrate it. No server-side inference is part of the fallback requirement.
 The application-facing entry point is `createLocalClient()`. It returns an
 instance of the official `openai@6.49.0` SDK with a local `fetch` transport.
 The contract reference is the installed SDK's
-`openai/resources/responses/responses.d.ts`, pinned on 2026-10-11. The executable
+`openai/resources/responses/responses.d.ts`, pinned SDK, checked on 2026-10-15. The executable
 support inventory is [responses-contract.json](../test/fixtures/responses-contract.json).
 Implementation: [local-client.js](../src/engine/local-client.js) and
 [responses.js](../src/engine/responses.js).
@@ -116,7 +116,7 @@ still cause network requests for model artifacts.
 | `max_output_tokens` | Integer 1–8192; omitted value uses a backend limit of 1024 |
 | `temperature`, `top_p` | Finite numbers in 0–2 and 0–1 respectively; both default to 1 |
 | `metadata` | At most 16 string pairs; key at most 64 characters, value at most 512 |
-| `text` | Plain text only: `{ format: { type: "text" } }` |
+| `text` | `text`, constrained `json_object`, or constrained/validated `json_schema`; see README support matrix |
 | `tools`, `include` | Empty arrays only |
 | `tool_choice` | `"auto"` or `"none"`; no tool execution |
 | `parallel_tool_calls` | Boolean retained in the response; no tool execution |
@@ -129,8 +129,7 @@ Rejected request fields include `context_management`, `conversation`,
 legacy scheduler's `session`, `priority`, `task`, and `preemptible`, are also
 rejected. Configure model/runtime setup outside the Responses body.
 
-Images, audio, file inputs, function calls/results, hosted tools, structured
-JSON/schema output, and dedicated reasoning/refusal output items are unsupported.
+Images, audio, file inputs, function calls/results, hosted tools, and dedicated reasoning/refusal output items are unsupported.
 `developer` messages map to backend system messages. Multiple text parts are
 concatenated. Message IDs must be unique across the combined history. Serialized
 history plus instructions is limited to 1,000,000 JavaScript characters; this
@@ -622,3 +621,60 @@ commits, or delete model files without an explicit request.
 
 Update this roadmap as milestones are verified. Maintain the root README for npm
 consumers; keep internal milestones and browser evidence in this roadmap.
+
+
+### Constrained JSON implementation (2026-10-15)
+
+`structured-output.js` validates format/schema before model loading, maps it to
+WebLLM `response_format`, caches at most 16 interpreted validators, and checks
+completed results without modifying streamed text. `strict:true` enforces all
+properties required; false/default/null keeps schema constraints with optional
+properties. All object schemas must be explicitly closed. See the README for
+supported/rejected keywords and local resource limits.
+
+The `structured-output-grammar` build patch fixes builtin JSON selection and
+compiler rejection propagation, disables unbounded native compilation caching,
+clears disposed matchers, and bounds Schema whitespace. Current matcher reuse
+remains available. Generated vendor Workers must be rebuilt from the patch.
+
+`npm run e2e:json` packs and installs a real tarball, then verifies constrained
+JSON, nested schemas, enum/nullable/escaping, anyOf/recursive references, SDK Zod
+parsing, streaming/retrieve, truncation, concurrency and cancellation recovery in
+Edge and Firefox. Evidence is under `artifacts/json-output/`. Diagnostics expose
+actual grammar initialization and decode timings without changing Responses usage.
+
+
+JSON verification completed on 2026-10-15 with the local
+`Qwen3.5-0.8B-q4f16_1-MLC` model and its matching cs1k WebGPU WASM on Apple M4.
+Both browsers passed all 16 harness checks from an installed tarball. Firefox
+used the existing harness WebGPU enabled / ignore-blocklist preferences; this is
+page inference evidence, not a production Service Worker or extension claim.
+
+| Browser | First Schema grammar init | Same Schema reset | Repeat decode | First / repeat request |
+| --- | --- | --- | --- | --- |
+| Edg/155.0.4283.45 | 147.60 ms | 0.40 ms | 30.22 tokens/s | 2823 / 1860 ms |
+| firefox/157.0.1 | 32.00 ms | 0.00 ms | 9.72 tokens/s | 6953 / 5610 ms |
+
+Single-run fixture measurements, not aggregate benchmark claims. The first JSON
+request separately initializes the token table/WASM; the Schema rows above follow
+that warmup. Repeated requests can produce different valid array lengths. JSON
+uses per-token grammar feedback and single-step decoding; do not compare these
+fixtures directly with plain-text multi-step throughput. Unsupported numeric and
+string constraints remain explicitly rejected as shown in the README.
+
+
+Sources checked for this implementation:
+[OpenAI Structured Outputs](https://developers.openai.com/api/docs/guides/structured-outputs?api-mode=responses),
+[XGrammar converter at the npm 0.1.27 gitHead](https://github.com/mlc-ai/xgrammar/blob/ace2321a29471130f3f64fb1882741a5547c6f36/cpp/json_schema_converter.cc),
+[cfworker validator](https://github.com/cfworker/cfworker/tree/main/packages/json-schema).
+Current upstream docs were not used to assume capabilities absent from the pinned runtime.
+
+
+### Version 0.1.4 distribution
+
+Version 0.1.4 packages the constrained JSON/JSON Schema implementation and its
+verification harness. Distribution target: GitHub Release `v0.1.4`, with the npm
+format `everything-webgpu-0.1.4.tgz` and `SHA256SUMS`; npm registry publishing is
+excluded by the user's release instruction. The README pins the GitHub asset URL.
+The release gate includes 283 tests, entry/type/patch checks and a clean-source
+real-tarball consumer verification. Browser runtime evidence is recorded above.

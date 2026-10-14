@@ -6,8 +6,9 @@
 file is a bundle: it contains the components listed below, and their licenses
 travel with it.
 
-The patches change two code paths for Firefox's WebGPU limits and compute-pass
-batching; they add no third-party code. Everything bundled is enumerated here.
+The patches cover WebGPU limits, compute/upload batching, device lifecycle, and
+constrained JSON grammar initialization. Everything bundled is enumerated here.
+The local output validator is supplied as a separate npm dependency.
 
 ---
 
@@ -264,4 +265,34 @@ HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
 WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
 FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 OTHER DEALINGS IN THE SOFTWARE.
+```
+
+
+## @cfworker/json-schema 4.1.1
+
+- License: **MIT**
+- Project: https://github.com/cfworker/cfworker/tree/main/packages/json-schema
+- Used as a separately installed, interpreted JSON Schema validator; consumer bundlers may inline it.
+```
+MIT License
+
+Copyright (c) 2020 Jeremy Danyow
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 ```

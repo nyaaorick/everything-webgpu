@@ -10,9 +10,10 @@ const ROOT = resolve(import.meta.dirname, "../..");
 const workPath = process.env.DEBUG_WORK ? resolve(process.env.DEBUG_WORK) : mkdtempSync(join(tmpdir(), "ewgpu-debug-"));
 mkdirSync(workPath, { recursive: true });
 const WORK = realpathSync(workPath);
+const jsonMode = process.env.JSON_OUTPUT === "1";
 const uploadMode = process.env.UPLOAD_BENCH === "1";
-const responsesMode = process.env.RESPONSES === "1" || uploadMode;
-const ARTIFACTS = join(ROOT, uploadMode ? `artifacts/upload-${process.env.NO_UPLOAD_BATCHING ? "baseline" : "batched"}` : responsesMode ? "artifacts/responses-debug" : "artifacts/browser-debug");
+const responsesMode = process.env.RESPONSES === "1" || uploadMode || jsonMode;
+const ARTIFACTS = process.env.DEBUG_ARTIFACTS ? resolve(process.env.DEBUG_ARTIFACTS) : join(ROOT, jsonMode ? "artifacts/json-output" : uploadMode ? `artifacts/upload-${process.env.NO_UPLOAD_BATCHING ? "baseline" : "batched"}` : responsesMode ? "artifacts/responses-debug" : "artifacts/browser-debug");
 const MODEL = (process.env.MODEL_DIR ?? join(homedir(), "Downloads/Qwen3.5-0.8B-q4f16_1-MLC")).replace(/^~/, homedir());
 mkdirSync(WORK, { recursive: true });
 mkdirSync(ARTIFACTS, { recursive: true });
@@ -20,7 +21,7 @@ const sh = (cmd, args, cwd) => execFileSync(cmd, args, { cwd, encoding: "utf8", 
 const tgz = sh("npm", ["pack", "--pack-destination", WORK], ROOT).trim().split("\n").pop();
 writeFileSync(join(WORK, "package.json"), JSON.stringify({ name: "ewgpu-debug", private: true, type: "module" }));
 console.log("Installing isolated browser debug dependencies…");
-sh("npm", ["install", join(WORK, tgz), "vite@6.4.4", "puppeteer-core@24.43.1", "@wllama/wllama@3.8.1"], WORK);
+sh("npm", ["install", join(WORK, tgz), "vite@6.4.4", "puppeteer-core@24.43.1", "@wllama/wllama@3.8.1", "zod@4.6.7"], WORK);
 const installed = join(WORK, "node_modules/everything-webgpu");
 const packageInfo = JSON.parse(readFileSync(join(installed, "package.json"), "utf8"));
 const runtimeFiles = [
@@ -32,7 +33,7 @@ for (const name of runtimeFiles) runtimeHash.update(name).update(readFileSync(jo
 const candidate = { version: packageInfo.version, sdk: packageInfo.dependencies.openai,
   tarballSHA256: createHash("sha256").update(readFileSync(join(WORK, tgz))).digest("hex"),
   runtimeSHA256: runtimeHash.digest("hex") };
-copyFileSync(join(import.meta.dirname, uploadMode ? "upload-page.js" : responsesMode ? "responses-page.js" : "debug-page.js"), join(WORK, "debug-page.js"));
+copyFileSync(join(import.meta.dirname, jsonMode ? "json-page.js" : uploadMode ? "upload-page.js" : responsesMode ? "responses-page.js" : "debug-page.js"), join(WORK, "debug-page.js"));
 writeFileSync(join(WORK, "index.html"), '<!doctype html><html lang="en"><meta charset="utf-8"><title>Everything WebGPU debug</title><body><h1>Edge / Firefox model verification</h1><pre style="white-space:pre-wrap"></pre><script type="module" src="/debug-page.js"></script></body></html>');
 const gguf = join(WORK, "stories260K.gguf");
 if (!responsesMode && !existsSync(gguf)) {

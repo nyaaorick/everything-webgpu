@@ -23,7 +23,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { build } from "esbuild";
 
-import { verifyPatches } from "../build/patches.mjs";
+import { verifyPatches, PATCHES } from "../build/patches.mjs";
 import { loadGPUWeights } from "../build/upload-batch.mjs";
 
 const bundle = (
@@ -135,7 +135,7 @@ test("a scoped anchor whose scope broke reports one problem, not two mysteries",
 test("the plan rewrites at verified offsets, back to front", () => {
   const { ok, plan } = verifyPatches(bundle);
   assert.ok(ok);
-  assert.equal(plan.length, 8);
+  assert.equal(plan.length, PATCHES.filter(p => !p.skipWhen?.()).reduce((n, p) => n + p.edits.length, 0));
   for (let i = 1; i < plan.length; i++) {
     assert.ok(plan[i].start < plan[i - 1].start, "plan must be sorted descending");
     assert.ok(plan[i].end <= plan[i - 1].start, "edits must not overlap");
@@ -198,4 +198,50 @@ test('rollback uses one barrier per tensor and empty models use none', async () 
   f.device.sync = async () => { f.waits.push(1); };
   assert.equal((await runUpload(f, undefined, 1)).barriers, 3);
   assert.equal((await runUpload(uploadFixture([[]]))).barriers, 0);
+});
+
+test('structured grammar patch propagates compiler rejection, recovers and reuses only the current matcher', async () => {
+  const { PATCHES } = await import('../build/patches.mjs');
+  const { readFileSync } = await import('node:fs');
+  const patch = PATCHES.find(p => p.id === 'structured-output-grammar');
+  const source = readFileSync(new URL('../vendor/web-llm.js', import.meta.url), 'utf8');
+  const begin = source.indexOf('      let grammarMatcherInitPromise = void 0;');
+  const end = source.indexOf('      if (conversation.isTextCompletion)', begin);
+  assert.ok(begin > 0 && end > begin);
+  const body = source.slice(begin, end);
+  // Exercise the actual generated prefill initialization with stubbed native
+  // compiler/matcher, without depending on a GPU or recompiling WASM in Node.
+  const awaiter = (self, _a, _b, factory) => {
+    const generator = factory.call(self);
+    return new Promise((resolve, reject) => {
+      const step = (verb, value) => {
+        let next; try { next = generator[verb](value); } catch (e) { reject(e); return; }
+        if (next.done) resolve(next.value);
+        else Promise.resolve(next.value).then(v => step('next', v), e => step('throw', e));
+      }; step('next');
+    });
+  };
+  let disposed = 0, reset = 0, builtins = 0, compiled = 0, cacheEnabled;
+  const matcher = () => ({ dispose() { disposed++; }, reset() { reset++; } });
+  const compiler = {
+    async compileBuiltinJSONGrammar() { builtins++; return { dispose() {} }; },
+    async compileJSONSchema(schema) { compiled++; if (schema === 'bad') throw new Error('compiler rejected'); return { dispose() {} }; },
+  };
+  const lib = { TokenizerInfo: { async createTokenizerInfo() { return {}; } },
+    GrammarCompiler: { async createGrammarCompiler(info, enabled) { cacheEnabled = enabled; return compiler; } },
+    GrammarMatcher: { async createGrammarMatcher() { return matcher(); } } };
+  const execute = new Function('genConfig', '__awaiter', 'libExports$1', 'getTokenTableFromTokenizer', 'log',
+    `return __awaiter(this, void 0, void 0, function* () { ${body}\nyield grammarMatcherInitPromise; });`);
+  const pipeline = { getResponseFormatKey(f) { return f.schema; } };
+  const run = f => execute.call(pipeline, { response_format: f }, awaiter, lib, () => [], { info() {} });
+  await run({ type: 'json_object' });
+  assert.equal(builtins, 1); assert.equal(cacheEnabled, false);
+  await run({ type: 'json_object' }); assert.equal(reset, 1);
+  await assert.rejects(run({ type: 'json_object', schema: 'bad' }), /compiler rejected/);
+  assert.equal(pipeline.grammarMatcher, undefined);
+  await run({ type: 'json_object', schema: 'good' });
+  assert.equal(compiled, 2); assert.equal(disposed, 1);
+  await run({ type: 'json_object', schema: 'good' }); assert.equal(reset, 2);
+  await run({ type: 'json_object' }); assert.equal(builtins, 2); assert.equal(disposed, 2);
+  assert.equal(patch.edits.length, 7);
 });

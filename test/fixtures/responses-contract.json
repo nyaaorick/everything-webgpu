@@ -1,6 +1,6 @@
 {
   "sdk": "openai@6.49.0",
-  "referenceDate": "2026-10-11",
+  "referenceDate": "2026-10-15",
   "source": "openai/resources/responses/responses.d.ts",
   "requestParameters": {
     "background": "supported with documented validation",
@@ -35,13 +35,14 @@
     "user": "rejected"
   },
   "methods": {
-    "create": "text and typed SSE",
+    "create": "text, constrained JSON/JSON Schema and typed SSE",
     "retrieve": "stored response and SSE replay",
     "delete": "terminal stored response",
     "cancel": "background only",
     "inputItems.list": "cursor pagination",
     "inputTokens.count": "unsupported",
-    "compact": "unsupported"
+    "compact": "unsupported",
+    "parse": "official SDK helper over supported json_schema"
   },
   "outputTypes": {
     "message/output_text": "supported",
@@ -50,5 +51,11 @@
     "refusal": "unsupported",
     "hosted_tool_outputs": "unsupported",
     "audio/image": "unsupported"
+  },
+  "textFormats": {
+    "text": "supported",
+    "json_object": "constrained JSON; completed output must be an object",
+    "json_schema": "constrained and validated documented subset",
+    "strict": "true requires all properties; false/omitted/null still constrain and validate schema"
   }
 }

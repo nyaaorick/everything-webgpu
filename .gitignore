@@ -16,3 +16,8 @@ types/
 artifacts/responses-debug/
 artifacts/upload-baseline/
 artifacts/upload-batched/
+
+artifacts/json-output/
+artifacts/json-output-2b/
+
+artifacts/release-0.1.4/

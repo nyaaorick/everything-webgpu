@@ -1,7 +1,19 @@
 {
   "webllmVersion": "0.2.84",
-  "appliedAt": "2026-10-10T19:38:47.092Z",
+  "appliedAt": "2026-10-14T18:11:20.489Z",
   "anchors": [
+    {
+      "patch": "structured-output-grammar",
+      "before": [
+        "this.grammarMatcher = yield libExports$1.GrammarMatcher.createGrammarMatcher(grammar); grammar.dispose();",
+        "this.grammarCompiler.compileJSONSchema(responseFormat.schema)",
+        "grammarMatcherInitPromise = new Promise((resolve) => __awaiter(this, void 0, void 0, function* () {",
+        "this.curRoundGrammarInitTotalTime = (performance.now() - tGrammarInitStart) / 1e3; resolve(); }));",
+        "responseFormat.type === void 0 ? yield this.grammarCompiler.compileBuiltinJSONGrammar()",
+        "GrammarCompiler.createGrammarCompiler(this.xgTokenizerInfo)",
+        "this.grammarMatcher.dispose(); } if (this.xgTokenizerInfo === void 0)"
+      ]
+    },
     {
       "patch": "gpu-weight-upload-batching",
       "before": [

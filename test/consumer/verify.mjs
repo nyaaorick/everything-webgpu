@@ -219,7 +219,7 @@ const viteConfig = (withPlugin) =>
 
 console.log("installing the packed tarball as a real dependency…");
 writeFileSync(join(APP, "vite.config.js"), viteConfig(false));
-sh("npm", ["install", tarball, "typescript@^5.9"], APP);
+sh("npm", ["install", tarball, "typescript@^5.9", "zod@4.6.7"], APP);
 
 // A real directory, not a symlink — otherwise this whole file proves nothing.
 const linked = readdirSync(join(APP, "node_modules"), { withFileTypes: true }).find(
@@ -282,6 +282,13 @@ request(OP.STATUS);
 const client = createLocalClient("test-model");
 const response = await client.responses.create({ model: "test-model", input: "Hello" });
 const text: string = response.output_text;
+await client.responses.create({ model: "test-model", input: "Return JSON.", text: { format: { type: "json_object" } } });
+const { z } = await import("zod");
+const { zodTextFormat } = await import("openai/helpers/zod");
+const extracted = await client.responses.parse({ model: "test-model", input: "Return JSON.",
+  text: { format: zodTextFormat(z.object({ name: z.string(), amount: z.number().nullable() }), "extraction") } });
+const extractedName: string | undefined = extracted.output_parsed?.name;
+void extractedName;
 for await (const event of await client.responses.create({ model: "test-model", input: text, stream: true })) {
   if (event.type === "response.output_text.delta") { const delta: string = event.delta; void delta; }
 }

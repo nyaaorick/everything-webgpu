@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import OpenAI, { APIError, APIUserAbortError } from 'openai';
 import { createResponsesTransport } from '../src/engine/responses.js';
 const tick = () => new Promise((resolve) => setTimeout(resolve, 1));
-function harness({ finish = 'stop', failure = null, delay = 0, maxStored = 128 } = {}) {
+function harness({ finish = 'stop', failure = null, delay = 0, maxStored = 128, chunks = ['Hel', 'lo'] } = {}) {
   const calls = [], cancelled = new Set();
   const engine = {
     cancel(id) { cancelled.add(id); return 1; },
@@ -11,7 +11,7 @@ function harness({ finish = 'stop', failure = null, delay = 0, maxStored = 128 }
       calls.push(request);
       if (failure) throw new Error(failure);
       let text = '';
-      for (const delta of ['Hel', 'lo']) {
+      for (const delta of chunks) {
         if (delay) await new Promise((r) => setTimeout(r, delay));
         if (cancelled.has(request.id)) return { text, cancelled: true, finishReason: 'abort' };
         text += delta; onChunk({ choices: [{ delta: { content: delta } }] });
@@ -237,4 +237,156 @@ test('runtime policies are isolated between clients and do not overwrite legacy 
   assert.deepEqual((await persistent.get('settings')).settings, { decodeSteps: 7, systemPrompt: 'Existing prompt' });
   await automatic.registerModel({ modelId: 'shared', model: 'https://local.example/resolve/main/', modelLib: 'https://local.example/model.wasm' });
   assert.equal((await baseline.get('shared')).model_id, 'shared');
+});
+
+const extractionSchema = { type: 'object', properties: {
+  name: { type: 'string' }, amount: { type: ['number', 'null'] },
+  kind: { type: 'string', enum: ['expense', 'income'] },
+}, required: ['name', 'amount', 'kind'], additionalProperties: false };
+const schemaFormat = (schema = extractionSchema, strict = true) => ({ type: 'json_schema', name: 'extraction', schema, strict });
+
+test('JSON formats reach inference, persist in events/retrieve, and SDK parse consumes Zod schema', async () => {
+  const { z } = await import('zod');
+  const { zodTextFormat } = await import('openai/helpers/zod');
+  const output = { name: '咖啡\\"店', amount: null, kind: 'expense' };
+  const { client, calls } = harness({ chunks: [JSON.stringify(output).slice(0, 8), JSON.stringify(output).slice(8)] });
+  const format = schemaFormat();
+  const r = await client.responses.create({ ...request, text: { format } });
+  assert.equal(r.status, 'completed');
+  assert.deepEqual(r.text.format, format);
+  assert.deepEqual((await client.responses.retrieve(r.id)).text.format, format);
+  assert.deepEqual(calls[0].response_format, { type: 'json_object', schema: JSON.stringify(extractionSchema) });
+  const parsed = await client.responses.parse({ ...request, text: { format: zodTextFormat(z.object({
+    name: z.string(), amount: z.number().nullable(), kind: z.enum(['expense', 'income']),
+  }), 'extraction') } });
+  assert.deepEqual(parsed.output_parsed, output);
+  const events = [];
+  for await (const e of await client.responses.create({ ...request, stream: true, text: { format: { type: 'json_object' } } })) events.push(e);
+  assert.equal(events.at(-1).type, 'response.completed');
+  assert.deepEqual(events[0].response.text.format, { type: 'json_object' });
+  assert.deepEqual(calls.at(-1).response_format, { type: 'json_object' });
+  assert.equal(events.filter(e => e.type === 'response.output_text.delta').map(e => e.delta).join(''), JSON.stringify(output));
+});
+
+test('completed JSON must parse and schema must validate; partial JSON remains incomplete', async () => {
+  for (const chunks of [['not JSON'], ['{"name":42,"amount":null,"kind":"expense"}']]) {
+    const { client } = harness({ chunks });
+    const r = await client.responses.create({ ...request, text: { format: schemaFormat() } });
+    assert.equal(r.status, 'failed'); assert.equal(r.error.code, 'server_error');
+    assert.match(r.error.message, /JSON|schema/i);
+  }
+  const { client } = harness({ chunks: ['{"name":'], finish: 'length' });
+  const r = await client.responses.create({ ...request, text: { format: schemaFormat() } });
+  assert.equal(r.status, 'incomplete'); assert.equal(r.output_text, '{"name":');
+});
+
+test('schema and format errors reject before inference with paths', async () => {
+  const { client, calls } = harness();
+  for (const format of [
+    { type: 'json_object', schema: {} }, { type: 'json_schema', name: 'bad name', schema: extractionSchema },
+    schemaFormat({ ...extractionSchema, properties: { name: { type: 'string', pattern: '.*' } } }),
+    schemaFormat({ ...extractionSchema, additionalProperties: true }),
+    schemaFormat({ ...extractionSchema, required: [] }),
+    schemaFormat({ type: 'object', properties: { a: { $ref: 'https://example.com/schema' } }, required: ['a'], additionalProperties: false }),
+    schemaFormat({ type: 'object', properties: { a: { $ref: '#/$defs/loop' } }, required: ['a'], additionalProperties: false,
+      $defs: { loop: { $ref: '#/$defs/loop' } } }),
+    schemaFormat({ ...extractionSchema, $defs: { unused: { type: 'string', format: 'email' } } }),
+    { ...schemaFormat(), strict: 'true' }, { ...schemaFormat(), description: null },
+    schemaFormat({ ...extractionSchema, required: null }, false),
+  ]) await assert.rejects(client.responses.create({ ...request, text: { format } }), e => e.status === 400 && e.param.startsWith('text.format'));
+  assert.equal(calls.length, 0);
+});
+
+test('local recursive refs, anyOf, false/default strict and schema switching remain isolated', async () => {
+  const recursive = { type: 'object', properties: { value: { type: 'integer' }, next: { anyOf: [{ $ref: '#' }, { type: 'null' }] } },
+    required: ['value', 'next'], additionalProperties: false };
+  const { client, calls } = harness({ chunks: ['{"value":1,"next":{"value":2,"next":null}}'] });
+  for (const strict of [true, false, undefined]) {
+    const format = { type: 'json_schema', name: 'node', schema: recursive, ...(strict === undefined ? {} : { strict }) };
+    assert.equal((await client.responses.create({ ...request, text: { format } })).status, 'completed');
+  }
+  const switched = await Promise.all([
+    client.responses.create({ ...request, text: { format: schemaFormat() } }),
+    client.responses.create({ ...request, text: { format: { type: 'json_object' } } }),
+  ]);
+  assert.deepEqual(switched.map(r => r.status), ['failed', 'completed']);
+  assert.ok(calls[3].response_format.schema.includes('amount'));
+  assert.equal(calls[4].response_format.schema, undefined);
+});
+
+
+test('array bounds and optional fields constrain and validate; bad bounds reject', async () => {
+  const schema = { type: 'object', properties: { values: { type: 'array', items: { type: 'integer' }, minItems: 1, maxItems: 2 }, note: { type: 'string' } }, required: ['values'], additionalProperties: false };
+  const { client } = harness({ chunks: ['{"values":[1,2]}'] });
+  assert.equal((await client.responses.create({ ...request, text: { format: schemaFormat(schema, false) } })).status, 'completed');
+  const invalid = harness({ chunks: ['{"values":[1,2,3]}'] });
+  assert.equal((await invalid.client.responses.create({ ...request, text: { format: schemaFormat(schema, false) } })).status, 'failed');
+  for (const bounds of [{ minItems: 3, maxItems: 2 }, { maxItems: 257 }, { minItems: -1 }, { maxItems: 0.5 }]) {
+    const badSchema = structuredClone(schema); Object.assign(badSchema.properties.values, bounds);
+    await assert.rejects(client.responses.create({ ...request, text: { format: schemaFormat(badSchema, false) } }), e => e.status === 400 && e.param.includes('Items'));
+  }
+});
+
+test('JSON validation failure terminates stream without repairing deltas', async () => {
+  const { client } = harness({ chunks: ['{"name":', '42}'] });
+  const events = [];
+  for await (const e of await client.responses.create({ ...request, stream: true, text: { format: schemaFormat() } })) events.push(e);
+  assert.equal(events.at(-1).type, 'response.failed');
+  assert.equal(events.filter(e => e.type === 'response.output_text.delta').map(e => e.delta).join(''), '{"name":42}');
+  assert.equal(events.at(-1).response.output[0].content[0].text, '{"name":42}');
+  assert.equal(events.at(-1).response.output[0].status, 'incomplete');
+  assert.ok(!events.some(e => e.type === 'response.completed'));
+});
+
+test('JSON cancellation releases generation and preserves format for background retrieve', async () => {
+  const { client, transport } = harness({ chunks: ['{"name":"a",', '"amount":null,"kind":"expense"}'], delay: 10 });
+  const first = await client.responses.create({ ...request, background: true, text: { format: schemaFormat() } });
+  await client.responses.cancel(first.id);
+  const cancelled = await client.responses.retrieve(first.id);
+  assert.equal(cancelled.status, 'cancelled'); assert.deepEqual(cancelled.text.format, schemaFormat());
+  const next = await client.responses.create({ ...request, text: { format: schemaFormat() } });
+  assert.equal(next.status, 'completed'); await transport.close();
+});
+
+test('Schema resource limits, invalid refs/types/enums and constraint siblings reject early', async () => {
+  const { client, calls } = harness();
+  const nested = { type: 'string' };
+  let deep = nested; for (let i=0; i<12; i++) deep = { type: 'array', items: deep };
+  for (const property of [deep, { type: [] }, { type: 'integer', enum: [1.5] }, { type: 'string', enum: ['a','a'] },
+    { $ref: '#/missing' }, { $ref: '#', type: 'object' }, { anyOf: [], type: 'string' },
+    { type: 'string', description: 'x'.repeat(65536) }, { anyOf: Array.from({ length:17 }, () => ({ type:'string' })) }]) {
+    const schema = { type: 'object', properties: { x: property }, required: ['x'], additionalProperties: false };
+    await assert.rejects(client.responses.create({ ...request, text: { format: schemaFormat(schema) } }), e => e.status === 400 && e.param.startsWith('text.format.schema'));
+  }
+  const escaped = { type: 'object', properties: { x: { $ref: '#/$defs/a~1b~0c' } }, required: ['x'], additionalProperties: false, $defs: { 'a/b~c': { type:'string' } } };
+  const valid = harness({ chunks: ['{"x":"yes"}'] });
+  assert.equal((await valid.client.responses.create({ ...request, text: { format: schemaFormat(escaped) } })).status, 'completed');
+  assert.equal(calls.length, 0);
+});
+
+
+test('primitive const and Zod literals work without ignoring conflicting literal constraints', async () => {
+  const { z } = await import('zod'); const { zodTextFormat } = await import('openai/helpers/zod');
+  const { client } = harness({ chunks: ['{"city":"香港"}'] });
+  const r = await client.responses.parse({ ...request, text: { format: zodTextFormat(z.object({ city: z.literal('香港') }), 'literal') } });
+  assert.deepEqual(r.output_parsed, { city: '香港' });
+  for (const property of [{ type:'string', const:42 }, { type:'string', const:'a', enum:['b'] }]) {
+    const schema = { type:'object', properties:{ city:property }, required:['city'], additionalProperties:false };
+    await assert.rejects(client.responses.create({ ...request, text:{ format:schemaFormat(schema) } }), e => e.status === 400 && e.param.endsWith('/const'));
+  }
+});
+
+
+test('schema defaults/null strict and explicit empty text format preserve local semantics', async () => {
+  const schema = { type:'object', properties:{ x:{ type:'string' } }, additionalProperties:false };
+  const { client } = harness({ chunks:['{}'] });
+  for (const strict of [undefined, null, false]) {
+    const format = { type:'json_schema', name:'optional', schema, ...(strict === undefined ? {} : { strict }) };
+    const r = await client.responses.create({ ...request, text:{ format } });
+    assert.equal(r.status, 'completed'); assert.deepEqual(r.text.format, format);
+  }
+  const plain = harness();
+  assert.equal((await plain.client.responses.create({ ...request, text:{ format:{} } })).output_text, 'Hello');
+  const scalar = harness({ chunks:['[]'] });
+  assert.equal((await scalar.client.responses.create({ ...request, text:{ format:{ type:'json_object' } } })).status, 'failed');
 });

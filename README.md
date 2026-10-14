@@ -6,8 +6,10 @@ Local browser inference through the official OpenAI SDK Responses interface.
 Runs MLC/WebLLM models on WebGPU; prompts and imported model files stay local.
 Remote model files are downloaded and cached. No OpenAI API key is required.
 
+Install version 0.1.4 from its GitHub Release:
+
 ```sh
-npm install everything-webgpu
+npm install https://github.com/nyaaorick/everything-webgpu/releases/download/v0.1.4/everything-webgpu-0.1.4.tgz
 ```
 
 ## Quick start
@@ -44,6 +46,85 @@ extension lifecycle are not verified. GPU weights upload in bounded batches of
 32 tensors or 32 MiB. In five cached reloads on this M4, median Firefox request
 time fell from 48.61 s to 4.02 s; Edge was 1.57 s. Timings include initialization
 and generation and depend on the model and device.
+
+## JSON and structured output
+
+JSON mode uses token-constrained decoding, not prompt-only JSON formatting:
+
+```ts
+const response = await client.responses.create({
+  model: modelId,
+  input: 'Return a JSON object with merchant and amount for: coffee shop, 25.',
+  text: { format: { type: 'json_object' } },
+  max_output_tokens: 128,
+});
+if (response.status !== 'completed') throw new Error(response.error?.message ?? response.status);
+const value = JSON.parse(response.output_text);
+```
+
+For field/type constraints, install `zod` in your application and use the SDK helper:
+
+```ts
+import { z } from 'zod';
+import { zodTextFormat } from 'openai/helpers/zod';
+
+const Extraction = z.object({
+  merchant: z.string(),
+  amount: z.number().nullable(),
+  kind: z.enum(['expense', 'income']),
+});
+const response = await client.responses.parse({
+  model: modelId,
+  input: 'Extract this transaction as JSON: paid 25 at coffee shop. Use null for missing amount.',
+  text: { format: zodTextFormat(Extraction, 'transaction') },
+  max_output_tokens: 192,
+});
+if (response.status !== 'completed' || !response.output_parsed) {
+  throw new Error(response.error?.message ?? response.status);
+}
+const transaction = Extraction.parse(response.output_parsed);
+```
+
+You can also use `responses.create()` with
+`text: { format: { type: 'json_schema', name: 'transaction', schema, strict: true } }`.
+`name` is 1–64 letters, digits, underscores or hyphens; `description` is optional.
+The schema reaches WebLLM/XGrammar as `response_format.schema` and constrains
+allowed tokens on every decode step. Completed JSON is parsed and Schema output
+is validated again locally. No output repair or automatic retries are performed.
+
+| Schema feature | Local support |
+| --- | --- |
+| Root | Object only; no root `anyOf` or `$ref` |
+| Types | object, array, string, number, integer, boolean, null; one type plus null |
+| Objects | `properties`, `required`, explicit `additionalProperties: false` |
+| Arrays | Homogeneous `items` schema; `minItems`/`maxItems` (0–256) |
+| Literals | Primitive `const`; unique primitive `enum` values matching their declared type |
+| Alternatives/references | Nested `anyOf`, `$defs`, local JSON Pointer `$ref`, productive recursion through properties/items |
+| Annotations | `title`, `description`; known draft-07/2019-09/2020-12 root `$schema` declarations |
+| Rejected | String patterns/formats/lengths, numeric bounds/multipleOf, array tuples, composition other than `anyOf`, external refs, constraint siblings of `$ref`/`anyOf`, nonproductive reference cycles |
+
+`strict: true` requires every object property in `required`; represent optional
+values using null. `strict: false`, omitted, or null permits optional properties,
+but still applies and validates every supplied constraint. Closed objects are
+required in all modes. This is a narrower subset than OpenAI's current Schema
+support, not full API or arbitrary JSON Schema compatibility. Unsupported formats
+and schemas return HTTP 400 with parameter paths before model loading.
+
+Local Schema limits: 64 KiB UTF-8, 2048 schema nodes, 10 nesting levels, 1000
+properties, 1000 enum values, and 16 branches per `anyOf`. Each client caches at
+most 16 interpreted validators; disposal clears them. Native compiler caching is
+disabled, while the current grammar matcher is reused/reset for an identical
+schema. Switching schemas recompiles. Schema whitespace is limited to two
+characters between elements to avoid whitespace-only stalls. JSON uses single-step
+decoding, so its speed can differ from automatically batched plain-text decoding.
+`client.diagnostics().runtime.measurements` reports `grammarInitMs` and
+`decodeTokensPerSecond` when the backend supplies them.
+
+Stream deltas are JSON fragments; wait for `response.completed` before parsing.
+Truncation returns `incomplete`; cancellation and failed validation never return
+`completed`. JSON structure does not establish business correctness: keep Zod and
+application checks for names, amounts and permitted operations. Prompts should
+still explain the extraction task and request JSON.
 
 ## Models: URL download or local import
 
@@ -122,8 +203,9 @@ for await (const event of stream) {
 | Continuation | `previous_response_id`; previous `instructions` are not inherited |
 | Generation | `instructions`, `max_output_tokens` (1–8192), `temperature` (0–2), `top_p` (0–1) |
 | Storage/execution | `store`, `background`, `stream`, `metadata`; background requires storage |
-| Restricted options | Plain `text.format`, empty `tools`/`include`, `tool_choice: "auto"`/`"none"`, boolean `parallel_tool_calls`, `truncation: "disabled"` |
-| Unsupported | Images/audio/files, tools, JSON schema, reasoning options, other request fields/endpoints |
+| Output format | `text`, `json_object`, `json_schema` (supported subset below); SDK `responses.parse()` |
+| Restricted options | empty `tools`/`include`, `tool_choice: "auto"`/`"none"`, boolean `parallel_tool_calls`, `truncation: "disabled"` |
+| Unsupported | Images/audio/files, tools, reasoning options, other request fields/endpoints |
 
 Unsupported fields return SDK API errors before inference. Scheduler fields
 such as `priority` and `session` are not Responses parameters. Backend failures
